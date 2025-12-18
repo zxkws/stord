@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.3"
+STORD_VERSION="0.2.4"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -466,6 +466,140 @@ warn_if_public_bind() {
   fi
 }
 
+is_valid_port() {
+  local p="${1:-}"
+  [[ "${p}" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 ))
+}
+
+port_in_use_proc() {
+  local port="${1:?port required}"
+  is_valid_port "${port}" || return 1
+  local ph
+  ph="$(printf "%04X" "${port}")"
+  # /proc/net/tcp and /proc/net/tcp6 are Linux-only but require no extra tools.
+  awk -v ph="${ph}" '
+    NR==1 {next}
+    {
+      split($2, a, ":");
+      p=toupper(a[2]);
+      st=$4;
+      if (p==ph && st=="0A") {found=1; exit}
+    }
+    END {exit(found?0:1)}
+  ' /proc/net/tcp 2>/dev/null && return 0 || true
+  awk -v ph="${ph}" '
+    NR==1 {next}
+    {
+      split($2, a, ":");
+      p=toupper(a[2]);
+      st=$4;
+      if (p==ph && st=="0A") {found=1; exit}
+    }
+    END {exit(found?0:1)}
+  ' /proc/net/tcp6 2>/dev/null && return 0 || true
+  return 1
+}
+
+port_in_use() {
+  local port="${1:?port required}"
+  if [[ -r /proc/net/tcp ]]; then
+    port_in_use_proc "${port}"
+    return $?
+  fi
+  if have ss; then
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}\$" && return 0 || true
+    return 1
+  fi
+  if have lsof; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0 || true
+    return 1
+  fi
+  if have netstat; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}\$" && return 0 || true
+    return 1
+  fi
+  # Unknown platform / no tools: best-effort says "not in use".
+  return 1
+}
+
+random_free_port() {
+  local min=20000 max=65000 tries=80 p
+  for ((i=0; i<tries; i++)); do
+    p=$((min + (RANDOM % (max - min + 1))))
+    if ! port_in_use "${p}"; then
+      echo "${p}"
+      return 0
+    fi
+  done
+  for ((p=min; p<=max; p++)); do
+    if ! port_in_use "${p}"; then
+      echo "${p}"
+      return 0
+    fi
+  done
+  die "unable to find a free TCP port in range ${min}-${max}"
+}
+
+select_port() {
+  local svc="${1:?service required}"
+  local label="${2:?label required}"
+  local def="${3:?default port required}"
+
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+    if port_in_use "${def}"; then
+      die "${label} default port ${def} is already in use; rerun interactively or pick another port"
+    fi
+    echo "${def}"
+    return 0
+  fi
+
+  local port
+  if confirm "Use random port for ${label}? (default: ${def})"; then
+    port="$(random_free_port)"
+    say "Selected random port: ${port}"
+    echo "${port}"
+    return 0
+  fi
+
+  port="$(prompt "${label} port" "${def}")"
+  while true; do
+    if ! is_valid_port "${port}"; then
+      warn "Invalid port: ${port} (must be 1-65535)"
+      port="$(prompt "${label} port" "${def}")"
+      continue
+    fi
+    if ! port_in_use "${port}"; then
+      echo "${port}"
+      return 0
+    fi
+
+    warn "Port ${port} is already in use."
+    say "1) Use a random free port"
+    say "2) Enter another port"
+    say "3) Abort"
+    local choice
+    choice="$(prompt "Select" "1")"
+    case "${choice}" in
+      1)
+        port="$(random_free_port)"
+        say "Selected random port: ${port}"
+        echo "${port}"
+        return 0
+        ;;
+      2)
+        port="$(prompt "${label} port" "")"
+        ;;
+      3)
+        die "aborted"
+        ;;
+      *)
+        say "Unknown selection."
+        ;;
+    esac
+  done
+}
+
 deploy_mariadb() {
   ensure_dirs
   ensure_docker
@@ -478,7 +612,7 @@ deploy_mariadb() {
   local bind default_bind port rootpw db user pass buf_mb
   default_bind="0.0.0.0"
   bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "${default_bind}")"
-  port="$(prompt "MariaDB port" "3306")"
+  port="$(select_port "${svc}" "MariaDB" "3306")"
   db="$(prompt "Database name" "appdb")"
   user="$(prompt "App username" "app")"
 
@@ -576,7 +710,7 @@ deploy_mongodb() {
 
   local bind port rootuser rootpass cache_mb cache_gb
   bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
-  port="$(prompt "MongoDB port" "27017")"
+  port="$(select_port "${svc}" "MongoDB" "27017")"
   rootuser="$(prompt "Mongo root username" "root")"
   rootpass="$(prompt_secret "Mongo root password" "<random>")"
   if [[ -z "${rootpass}" ]]; then rootpass="$(random_hex 16)"; fi
@@ -669,7 +803,7 @@ deploy_redis() {
 
   local bind port pass maxmem
   bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
-  port="$(prompt "Redis port" "6379")"
+  port="$(select_port "${svc}" "Redis" "6379")"
   maxmem="$(prompt "Redis maxmemory (e.g. 128mb)" "$(suggest_redis_maxmem_mb)mb")"
   pass="$(prompt_secret "Redis password" "<random>")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
