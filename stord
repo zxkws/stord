@@ -1,0 +1,1882 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STORD_VERSION="0.2.3"
+
+PROG_NAME_DEFAULT="stord"
+PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
+
+STORD_RAW_URL_DEFAULT="https://raw.githubusercontent.com/zxkws/stord/main/stord"
+STORD_RAW_URL="${STORD_RAW_URL:-${STORD_URL:-$STORD_RAW_URL_DEFAULT}}"
+
+# When running as `curl ... | bash`, stdin is not a TTY. Read input from /dev/tty if available.
+# In non-TTY contexts (CI), /dev/tty may not be configured, so this must be best-effort.
+STORD_INPUT_FD=0
+if [[ ! -t 0 && -t 1 && -r /dev/tty ]]; then
+  # shellcheck disable=SC2094
+  if exec 3</dev/tty; then
+    STORD_INPUT_FD=3
+  fi
+fi
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+default_home() {
+  echo "/opt/${PROG_NAME}"
+}
+
+STORD_HOME="${STORD_HOME:-$(default_home)}"
+STORD_SERVICES_DIR="${STORD_SERVICES_DIR:-${STORD_HOME}/services}"
+STORD_BACKUPS_DIR="${STORD_BACKUPS_DIR:-${STORD_HOME}/backups}"
+STORD_STATE_DIR="${STORD_STATE_DIR:-${STORD_HOME}/state}"
+STORD_LOG_DIR="${STORD_LOG_DIR:-${STORD_HOME}/logs}"
+
+umask 077
+
+STORD_ASSUME_YES="${STORD_ASSUME_YES:-0}"                 # --yes
+STORD_NON_INTERACTIVE="${STORD_NON_INTERACTIVE:-0}"       # --non-interactive (use defaults, but don't auto-confirm)
+STORD_QUIET="${STORD_QUIET:-0}"                           # --quiet
+STORD_DEBUG="${STORD_DEBUG:-0}"                           # --debug
+
+on_error() {
+  local code=$?
+  local line="${BASH_LINENO[0]:-?}"
+  local cmd="${BASH_COMMAND:-?}"
+  printf "error: failed at line %s: %s\n" "${line}" "${cmd}" >&2
+  exit "${code}"
+}
+trap on_error ERR
+
+say() {
+  [[ "${STORD_QUIET}" == "1" ]] && return 0
+  printf "%s\n" "$*"
+}
+warn() { printf "warn: %s\n" "$*" >&2; }
+die() { printf "error: %s\n" "$*" >&2; exit 1; }
+
+if [[ "${STORD_DEBUG}" == "1" ]]; then
+  set -x
+fi
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require() {
+  local cmd="$1"
+  have "${cmd}" || die "missing dependency: ${cmd}"
+}
+
+ver_cmp() {
+  # Compare two dotted versions (e.g. 0.2.10 vs 0.2.2).
+  # Prints -1, 0, or 1.
+  local a="$1" b="$2"
+  local -a av bv
+  local IFS=.
+  read -r -a av <<<"${a}"
+  read -r -a bv <<<"${b}"
+  local i max n1 n2
+  max="${#av[@]}"
+  (( "${#bv[@]}" > max )) && max="${#bv[@]}"
+  for ((i=0; i<max; i++)); do
+    n1="${av[i]:-0}"
+    n2="${bv[i]:-0}"
+    [[ "${n1}" =~ ^[0-9]+$ ]] || n1=0
+    [[ "${n2}" =~ ^[0-9]+$ ]] || n2=0
+    if (( n1 < n2 )); then echo -1; return 0; fi
+    if (( n1 > n2 )); then echo 1; return 0; fi
+  done
+  echo 0
+}
+
+remote_version() {
+  require curl
+  # Pull only what we need: grep/sed on the downloaded script text.
+  # If the format changes, this simply returns empty and skips update prompt.
+  curl -fsSL "${STORD_RAW_URL}" 2>/dev/null | sed -n 's/^STORD_VERSION="\(.*\)".*/\1/p' | head -n 1 || true
+}
+
+check_update() {
+  local rv
+  rv="$(remote_version || true)"
+  if [[ -z "${rv}" ]]; then
+    say "Update check: unable to determine remote version."
+    return 0
+  fi
+  say "Local:  ${STORD_VERSION}"
+  say "Remote: ${rv}"
+  if [[ "$(ver_cmp "${STORD_VERSION}" "${rv}")" -lt 0 ]]; then
+    say "Update available."
+    return 0
+  fi
+  say "Up to date."
+  return 0
+}
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  local ans
+  while true; do
+    if [[ "${STORD_ASSUME_YES}" == "1" ]]; then
+      return 0
+    fi
+    if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+      return 1
+    fi
+    read -r -u "${STORD_INPUT_FD}" -p "${prompt} [y/N] " ans || true
+    ans="${ans:-N}"
+    case "${ans,,}" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+      *) say "Please answer y or n." ;;
+    esac
+  done
+}
+
+prompt() {
+  local label="$1"
+  local def="${2:-}"
+  local out
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+    if [[ -n "${def}" ]]; then
+      printf "%s" "${def}"
+      return 0
+    fi
+    die "non-interactive mode requires defaults: ${label}"
+  fi
+  if [[ -n "${def}" ]]; then
+    read -r -u "${STORD_INPUT_FD}" -p "${label} [${def}]: " out || true
+    out="${out:-$def}"
+  else
+    read -r -u "${STORD_INPUT_FD}" -p "${label}: " out || true
+  fi
+  printf "%s" "${out}"
+}
+
+prompt_secret() {
+  local label="$1"
+  local def_hint="${2:-<random>}"
+  local out
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+    printf "%s" ""
+    return 0
+  fi
+  read -r -s -u "${STORD_INPUT_FD}" -p "${label} [${def_hint}]: " out || true
+  printf "\n" >&2
+  printf "%s" "${out}"
+}
+
+random_hex() {
+  local n="${1:-16}"
+  if have openssl; then
+    openssl rand -hex "${n}" 2>/dev/null | tr -d '\n'
+    return 0
+  fi
+  # fallback
+  head -c 1024 /dev/urandom | LC_ALL=C tr -dc 'a-f0-9' | head -c $((n * 2))
+}
+
+maybe_offer_update() {
+  # Only in interactive menu, and only once per run.
+  [[ "${STORD_UPDATE_CHECKED:-0}" == "1" ]] && return 0
+  export STORD_UPDATE_CHECKED=1
+  [[ "${STORD_NON_INTERACTIVE}" == "1" ]] && return 0
+  [[ "${STORD_QUIET}" == "1" ]] && return 0
+  [[ "${STORD_NO_UPDATE_CHECK:-0}" == "1" ]] && return 0
+
+  local rv
+  rv="$(remote_version || true)"
+  [[ -n "${rv}" ]] || return 0
+  if [[ "$(ver_cmp "${STORD_VERSION}" "${rv}")" -lt 0 ]]; then
+    say
+    say "Update available: ${STORD_VERSION} -> ${rv}"
+    if confirm "Update ${PROG_NAME} now?"; then
+      (STORD_ASSUME_YES=1 self_update)
+      say
+    fi
+  fi
+}
+
+ensure_dirs() {
+  if mkdir -p "${STORD_SERVICES_DIR}" "${STORD_BACKUPS_DIR}" "${STORD_STATE_DIR}" "${STORD_LOG_DIR}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! is_root; then
+    warn "No permission to create storage dirs under: ${STORD_HOME}"
+    say "To keep the default path, run with sudo:"
+    say "  sudo -E ${PROG_NAME}"
+    say
+    say "Or override the data dir for your user:"
+    say "  STORD_HOME=\"${HOME}/.${PROG_NAME}\" ${PROG_NAME}"
+    say
+    if confirm "Switch to user data dir now (${HOME}/.${PROG_NAME}) and continue?"; then
+      STORD_HOME="${HOME}/.${PROG_NAME}"
+      STORD_SERVICES_DIR="${STORD_HOME}/services"
+      STORD_BACKUPS_DIR="${STORD_HOME}/backups"
+      STORD_STATE_DIR="${STORD_HOME}/state"
+      STORD_LOG_DIR="${STORD_HOME}/logs"
+      mkdir -p "${STORD_SERVICES_DIR}" "${STORD_BACKUPS_DIR}" "${STORD_STATE_DIR}" "${STORD_LOG_DIR}"
+      return 0
+    fi
+  fi
+  die "failed to create storage dirs under: ${STORD_HOME}"
+}
+
+mem_total_mb() {
+  if [[ -r /proc/meminfo ]]; then
+    awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo
+    return 0
+  fi
+  if have sysctl; then
+    local bytes
+    bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+    if [[ "${bytes}" =~ ^[0-9]+$ ]]; then
+      echo $((bytes / 1024 / 1024))
+      return 0
+    fi
+  fi
+  echo 1024
+}
+
+clamp_int() {
+  local v="$1" min="$2" max="$3"
+  if (( v < min )); then echo "${min}"; return 0; fi
+  if (( v > max )); then echo "${max}"; return 0; fi
+  echo "${v}"
+}
+
+suggest_mariadb_buffer_pool_mb() {
+  local m; m="$(mem_total_mb)"
+  local v=$((m * 30 / 100))
+  clamp_int "${v}" 128 512
+}
+
+suggest_mongodb_cache_mb() {
+  local m; m="$(mem_total_mb)"
+  local v=$((m * 25 / 100))
+  clamp_int "${v}" 128 512
+}
+
+suggest_redis_maxmem_mb() {
+  local m; m="$(mem_total_mb)"
+  local v=$((m * 12 / 100))
+  clamp_int "${v}" 64 256
+}
+
+compose_bin() {
+  if have docker && docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+    return 0
+  fi
+  if have docker-compose; then
+    echo "docker-compose"
+    return 0
+  fi
+  return 1
+}
+
+compose() {
+  local service="$1"; shift
+  local svc_dir="${STORD_SERVICES_DIR}/${service}"
+  local f="${svc_dir}/docker-compose.yml"
+  [[ -f "${f}" ]] || die "service not deployed: ${service} (missing ${f})"
+
+  local cb
+  cb="$(compose_bin)" || die "docker compose not found (install docker + compose plugin)"
+
+  # Ensure `.env` and relative paths resolve against the service directory.
+  # shellcheck disable=SC2086
+  ${cb} --project-directory "${svc_dir}" -f "${f}" "$@"
+}
+
+mask_value() {
+  local v="${1:-}"
+  if [[ -z "${v}" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "${#v}" -le 6 ]]; then
+    echo "***"
+    return 0
+  fi
+  echo "${v:0:2}***${v: -2}"
+}
+
+load_kv() {
+  # load env file key=value lines into stdout "key=value"
+  local f="$1"
+  [[ -f "${f}" ]] || return 0
+  grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "${f}" | sed 's/\r$//'
+}
+
+show_env() {
+  local service="$1"
+  local svc_dir="${STORD_SERVICES_DIR}/${service}"
+  local envf="${svc_dir}/.env"
+  [[ -f "${envf}" ]] || die "missing env: ${envf}"
+
+  say "Service: ${service}"
+  say "Config:  ${svc_dir}"
+  say
+  while IFS='=' read -r k v; do
+    case "${k}" in
+      *PASS*|*PASSWORD*|*SECRET*|*TOKEN*)
+        say "${k}=$(mask_value "${v}")"
+        ;;
+      *)
+        say "${k}=${v}"
+        ;;
+    esac
+  done < <(load_kv "${envf}")
+}
+
+show_env_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    [[ -n "${svc}" ]] || continue
+    local envf; envf="$(service_dir "${svc}")/.env"
+    [[ -f "${envf}" ]] || continue
+    any=1
+    say
+    show_env "${svc}"
+  done < <(list_services)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+ensure_docker() {
+  if have docker; then
+    return 0
+  fi
+  say "Docker is not installed."
+  say "Recommended: install Docker Engine + compose plugin."
+  say
+  if confirm "Install Docker via official convenience script (get.docker.com)?"; then
+    require curl
+    curl -fsSL https://get.docker.com | sh
+    say "Docker installed. You may need to relogin or run: sudo usermod -aG docker $USER"
+  else
+    die "docker is required"
+  fi
+}
+
+ensure_compose() {
+  compose_bin >/dev/null 2>&1 || die "docker compose not available (install docker compose plugin or docker-compose)"
+}
+
+pkg_manager() {
+  if have apt-get; then echo "apt"; return 0; fi
+  if have dnf; then echo "dnf"; return 0; fi
+  if have yum; then echo "yum"; return 0; fi
+  if have apk; then echo "apk"; return 0; fi
+  return 1
+}
+
+pkg_install() {
+  local pm; pm="$(pkg_manager)" || die "no supported package manager found (apt/yum/dnf/apk)"
+  if ! is_root; then
+    die "package installation requires root"
+  fi
+  case "${pm}" in
+    apt)
+      DEBIAN_FRONTEND=noninteractive apt-get update -y
+      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+      ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+    apk) apk add --no-cache "$@" ;;
+  esac
+}
+
+ensure_crontab() {
+  if have crontab; then
+    return 0
+  fi
+  warn "crontab not found; backup scheduling needs cron."
+  if ! confirm "Install cron now?"; then
+    die "crontab not found (install cron)"
+  fi
+  local pm; pm="$(pkg_manager)" || die "no supported package manager found (apt/yum/dnf/apk)"
+  case "${pm}" in
+    apt) pkg_install cron ;;
+    dnf|yum) pkg_install cronie ;;
+    apk) pkg_install cronie ;;
+  esac
+  have crontab || die "installed cron but crontab still not found"
+  warn "cron installed. Ensure the cron service is enabled/running on your system."
+}
+
+write_file() {
+  local path="$1"
+  local content="$2"
+  mkdir -p "$(dirname "${path}")"
+  printf "%s" "${content}" > "${path}"
+}
+
+service_dir() {
+  echo "${STORD_SERVICES_DIR}/$1"
+}
+
+env_get() {
+  local svc="$1" key="$2"
+  local envf; envf="$(service_dir "${svc}")/.env"
+  [[ -f "${envf}" ]] || return 1
+  grep -E "^${key}=" "${envf}" | head -n 1 | cut -d= -f2- || true
+}
+
+svc_default_port() {
+  case "${1:-}" in
+    mariadb) echo "3306" ;;
+    mongodb) echo "27017" ;;
+    redis) echo "6379" ;;
+    *) echo "" ;;
+  esac
+}
+
+svc_host_port() {
+  local svc="${1:?service required}"
+  local port
+  port="$(env_get "${svc}" STORE_PORT || true)"
+  port="${port:-$(svc_default_port "${svc}")}"
+  [[ -n "${port}" ]] || die "unknown service: ${svc}"
+  echo "${port}"
+}
+
+dsn_host_hint() {
+  local svc="${1:?service required}"
+  local host
+  host="$(env_get "${svc}" STORE_BIND || true)"
+  host="${host:-127.0.0.1}"
+  if [[ "${host}" == "0.0.0.0" ]]; then
+    echo "<server-host>"
+  else
+    echo "${host}"
+  fi
+}
+
+container_name() {
+  local svc="${1:?service required}"
+  echo "${PROG_NAME}-${svc}"
+}
+
+warn_if_public_bind() {
+  local bind="$1" port="$2" svc="$3"
+  if [[ "${bind}" == "0.0.0.0" ]]; then
+    warn "${svc} is bound to 0.0.0.0:${port} (public). Ensure firewall whitelists your app server IP."
+  fi
+}
+
+deploy_mariadb() {
+  ensure_dirs
+  ensure_docker
+  ensure_compose
+
+  local svc="mariadb"
+  local svc_dir="${STORD_SERVICES_DIR}/${svc}"
+  mkdir -p "${svc_dir}/data" "${svc_dir}/conf.d"
+
+  local bind default_bind port rootpw db user pass buf_mb
+  default_bind="0.0.0.0"
+  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "${default_bind}")"
+  port="$(prompt "MariaDB port" "3306")"
+  db="$(prompt "Database name" "appdb")"
+  user="$(prompt "App username" "app")"
+
+  rootpw="$(prompt_secret "Root password" "<random>")"
+  if [[ -z "${rootpw}" ]]; then rootpw="$(random_hex 16)"; fi
+  pass="$(prompt_secret "App user password" "<random>")"
+  if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
+
+  buf_mb="$(prompt "InnoDB buffer pool (MB)" "$(suggest_mariadb_buffer_pool_mb)")"
+  if [[ ! "${buf_mb}" =~ ^[0-9]+$ ]]; then die "buffer pool must be an integer (MB)"; fi
+
+  write_file "${svc_dir}/.env" \
+    "MARIADB_ROOT_PASSWORD=${rootpw}
+MARIADB_DATABASE=${db}
+MARIADB_USER=${user}
+MARIADB_PASSWORD=${pass}
+TZ=Asia/Seoul
+STORE_BIND=${bind}
+STORE_PORT=${port}
+"
+
+  write_file "${svc_dir}/conf.d/my.cnf" \
+"[mysqld]
+innodb_buffer_pool_size=${buf_mb}M
+innodb_log_file_size=64M
+innodb_flush_log_at_trx_commit=2
+max_connections=80
+thread_cache_size=32
+table_open_cache=1024
+tmp_table_size=32M
+max_heap_table_size=32M
+slow_query_log=1
+long_query_time=1
+log_queries_not_using_indexes=0
+skip_name_resolve=ON
+default_time_zone='+09:00'
+character-set-server=utf8mb4
+collation-server=utf8mb4_unicode_ci
+"
+
+  write_file "${svc_dir}/docker-compose.yml" \
+"services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: ${PROG_NAME}-mariadb
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - \"${bind}:${port}:3306\"
+    volumes:
+      - ./data:/var/lib/mysql
+      - ./conf.d/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-name-resolve
+    healthcheck:
+      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -p\\$\\$MARIADB_ROOT_PASSWORD --silent\"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+"
+
+  say
+  say "About to deploy MariaDB:"
+  say "- dir:  ${svc_dir}"
+  say "- bind: ${bind}:${port}"
+  say
+  warn_if_public_bind "${bind}" "${port}" "mariadb"
+  if ! confirm "Run docker compose up -d now?"; then
+    say "Saved config only. Start later with: ${PROG_NAME} start mariadb"
+    return 0
+  fi
+
+  compose "${svc}" up -d
+  say "MariaDB started."
+  say
+  say "Connection:"
+  say "- host: ${bind}"
+  say "- port: ${port}"
+  say "- db:   ${db}"
+  say "- user: ${user}"
+  say "- pass: ${pass}"
+  say "- root: ${rootpw}"
+}
+
+deploy_mongodb() {
+  ensure_dirs
+  ensure_docker
+  ensure_compose
+
+  local svc="mongodb"
+  local svc_dir="${STORD_SERVICES_DIR}/${svc}"
+  mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
+
+  local bind port rootuser rootpass cache_mb cache_gb
+  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
+  port="$(prompt "MongoDB port" "27017")"
+  rootuser="$(prompt "Mongo root username" "root")"
+  rootpass="$(prompt_secret "Mongo root password" "<random>")"
+  if [[ -z "${rootpass}" ]]; then rootpass="$(random_hex 16)"; fi
+
+  cache_mb="$(prompt "MongoDB WiredTiger cache (MB)" "$(suggest_mongodb_cache_mb)")"
+  if [[ ! "${cache_mb}" =~ ^[0-9]+$ ]]; then
+    die "cache_mb must be an integer"
+  fi
+  cache_gb="$(awk "BEGIN { printf \"%.3f\", ${cache_mb}/1024 }")"
+
+  write_file "${svc_dir}/.env" \
+    "MONGO_INITDB_ROOT_USERNAME=${rootuser}
+MONGO_INITDB_ROOT_PASSWORD=${rootpass}
+TZ=Asia/Seoul
+STORE_BIND=${bind}
+STORE_PORT=${port}
+MONGO_CACHE_GB=${cache_gb}
+"
+
+  write_file "${svc_dir}/conf/mongod.conf" \
+"storage:
+  dbPath: /data/db
+  journal:
+    enabled: true
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: ${cache_gb}
+
+net:
+  port: 27017
+  bindIp: 0.0.0.0
+
+security:
+  authorization: enabled
+
+processManagement:
+  fork: false
+"
+
+  write_file "${svc_dir}/docker-compose.yml" \
+"services:
+  mongo:
+    image: mongo:7.0
+    container_name: ${PROG_NAME}-mongodb
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - \"${bind}:${port}:27017\"
+    volumes:
+      - ./data:/data/db
+      - ./conf/mongod.conf:/etc/mongod.conf:ro
+    command: [\"mongod\", \"--config\", \"/etc/mongod.conf\"]
+    healthcheck:
+      test: [\"CMD-SHELL\", \"mongosh --quiet --username \\$\\$MONGO_INITDB_ROOT_USERNAME --password \\$\\$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.runCommand({ ping: 1 }).ok' | grep 1\"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+"
+
+  say
+  say "About to deploy MongoDB:"
+  say "- dir:  ${svc_dir}"
+  say "- bind: ${bind}:${port}"
+  say "- cache: ${cache_mb}MB (${cache_gb}GB)"
+  say
+  warn_if_public_bind "${bind}" "${port}" "mongodb"
+  if ! confirm "Run docker compose up -d now?"; then
+    say "Saved config only. Start later with: ${PROG_NAME} start mongodb"
+    return 0
+  fi
+
+  compose "${svc}" up -d
+  say "MongoDB started."
+  say
+  say "Connection:"
+  say "- host: ${bind}"
+  say "- port: ${port}"
+  say "- user: ${rootuser}"
+  say "- pass: ${rootpass}"
+}
+
+deploy_redis() {
+  ensure_dirs
+  ensure_docker
+  ensure_compose
+
+  local svc="redis"
+  local svc_dir="${STORD_SERVICES_DIR}/${svc}"
+  mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
+
+  local bind port pass maxmem
+  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
+  port="$(prompt "Redis port" "6379")"
+  maxmem="$(prompt "Redis maxmemory (e.g. 128mb)" "$(suggest_redis_maxmem_mb)mb")"
+  pass="$(prompt_secret "Redis password" "<random>")"
+  if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
+
+  write_file "${svc_dir}/.env" \
+    "TZ=Asia/Seoul
+STORE_BIND=${bind}
+STORE_PORT=${port}
+REDIS_PASSWORD=${pass}
+REDIS_MAXMEM=${maxmem}
+"
+
+  write_file "${svc_dir}/conf/redis.conf" \
+"bind 0.0.0.0
+port 6379
+protected-mode yes
+requirepass ${pass}
+maxmemory ${maxmem}
+maxmemory-policy allkeys-lru
+appendonly yes
+appendfsync everysec
+save 900 1
+save 300 10
+save 60 10000
+"
+
+  write_file "${svc_dir}/docker-compose.yml" \
+"services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: ${PROG_NAME}-redis
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - \"${bind}:${port}:6379\"
+    volumes:
+      - ./data:/data
+      - ./conf/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: [\"redis-server\", \"/usr/local/etc/redis/redis.conf\"]
+    healthcheck:
+      test: [\"CMD-SHELL\", \"redis-cli -a \\$\\$REDIS_PASSWORD ping | grep PONG\"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+"
+
+  say
+  say "About to deploy Redis:"
+  say "- dir:  ${svc_dir}"
+  say "- bind: ${bind}:${port}"
+  say "- maxmemory: ${maxmem}"
+  say
+  warn_if_public_bind "${bind}" "${port}" "redis"
+  if ! confirm "Run docker compose up -d now?"; then
+    say "Saved config only. Start later with: ${PROG_NAME} start redis"
+    return 0
+  fi
+
+  compose "${svc}" up -d
+  say "Redis started."
+  say
+  say "Connection:"
+  say "- host: ${bind}"
+  say "- port: ${port}"
+  say "- pass: ${pass}"
+}
+
+deploy() {
+  local svc="${1:-}"
+  case "${svc}" in
+    mariadb) deploy_mariadb ;;
+    mongodb) deploy_mongodb ;;
+    redis) deploy_redis ;;
+    *) die "usage: ${PROG_NAME} deploy {mariadb|mongodb|redis}" ;;
+  esac
+}
+
+start_service() { compose "$1" up -d; }
+stop_service() { compose "$1" down; }
+restart_service() { compose "$1" restart; }
+status_service() { compose "$1" ps; }
+logs_service() { compose "$1" logs -f --tail=200; }
+
+for_each_deployed() {
+  local svc
+  while IFS= read -r svc; do
+    [[ -n "${svc}" ]] || continue
+    local svc_dir; svc_dir="$(service_dir "${svc}")"
+    if [[ -f "${svc_dir}/docker-compose.yml" ]]; then
+      printf "%s\n" "${svc}"
+    else
+      warn "Skipping ${svc}: missing docker-compose.yml"
+    fi
+  done < <(list_services)
+}
+
+status_all() {
+  if ! compose_bin >/dev/null 2>&1; then
+    say "compose is not available; cannot show container status."
+    say "Deployed service dirs:"
+    list_services | sed 's/^/ - /'
+    return 0
+  fi
+  local any=0 svc
+  while IFS= read -r svc; do
+    any=1
+    say
+    say "== ${svc} =="
+    compose "${svc}" ps || true
+  done < <(for_each_deployed)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+start_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    any=1
+    say "Starting: ${svc}"
+    compose "${svc}" up -d
+  done < <(for_each_deployed)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+stop_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    any=1
+    say "Stopping: ${svc}"
+    compose "${svc}" down
+  done < <(for_each_deployed)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+restart_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    any=1
+    say "Restarting: ${svc}"
+    compose "${svc}" restart
+  done < <(for_each_deployed)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+logs_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    any=1
+    say
+    say "== ${svc} (tail 200) =="
+    compose "${svc}" logs --tail=200 || true
+  done < <(for_each_deployed)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+remove_service() {
+  local svc="${1:?service required}"
+  say "Remove service (stop containers): ${svc}"
+  if ! confirm "docker compose down for ${svc}?"; then
+    say "Canceled."
+    return 0
+  fi
+  compose "${svc}" down
+  say "Stopped: ${svc}"
+}
+
+purge_service() {
+  local svc="${1:?service required}"
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  [[ -d "${svc_dir}" ]] || die "service not deployed: ${svc}"
+  say "Purge service (STOP + DELETE DATA): ${svc}"
+  say "- dir: ${svc_dir}"
+  say
+  warn "This will delete ${svc_dir} (including ./data)."
+  if ! confirm "Proceed with purge?"; then
+    say "Canceled."
+    return 0
+  fi
+  if [[ "${STORD_ASSUME_YES}" != "1" && "${STORD_NON_INTERACTIVE}" != "1" ]]; then
+    local typed
+    typed="$(prompt "Confirm by typing YES" "")"
+    [[ "${typed}" == "YES" ]] || die "purge not confirmed"
+  fi
+  compose "${svc}" down || true
+  rm -rf "${svc_dir}"
+  say "Purged: ${svc}"
+}
+
+config_path() {
+  local svc="${1:?service required}"
+  echo "$(service_dir "${svc}")"
+}
+
+config_edit() {
+  local svc="${1:?service required}"
+  local envf; envf="$(service_dir "${svc}")/.env"
+  [[ -f "${envf}" ]] || die "missing env: ${envf}"
+  local editor="${EDITOR:-}"
+  if [[ -z "${editor}" ]]; then
+    if have nano; then editor="nano"; elif have vim; then editor="vim"; else editor="vi"; fi
+  fi
+  "${editor}" "${envf}"
+}
+
+dsn_service() {
+  local svc="${1:?service required}"
+  local host port
+  host="$(dsn_host_hint "${svc}")"
+  port="$(svc_host_port "${svc}")"
+
+  case "${svc}" in
+    mariadb)
+      local db user pass
+      db="$(env_get mariadb MARIADB_DATABASE || true)"
+      user="$(env_get mariadb MARIADB_USER || true)"
+      pass="$(env_get mariadb MARIADB_PASSWORD || true)"
+      say "mysql://${user}:<password>@${host}:${port}/${db}"
+      ;;
+    mongodb)
+      local user pass
+      user="$(env_get mongodb MONGO_INITDB_ROOT_USERNAME || true)"
+      pass="$(env_get mongodb MONGO_INITDB_ROOT_PASSWORD || true)"
+      say "mongodb://${user}:<password>@${host}:${port}/?authSource=admin"
+      ;;
+    redis)
+      say "redis://:<password>@${host}:${port}/0"
+      ;;
+    *)
+      die "unknown service: ${svc}"
+      ;;
+  esac
+}
+
+dsn_all() {
+  local any=0 svc
+  while IFS= read -r svc; do
+    [[ -n "${svc}" ]] || continue
+    local envf; envf="$(service_dir "${svc}")/.env"
+    [[ -f "${envf}" ]] || continue
+    any=1
+    say "${svc}: $(dsn_service "${svc}")"
+  done < <(list_services)
+  if [[ "${any}" == "0" ]]; then
+    say "No deployed services."
+  fi
+}
+
+secrets_service() {
+  local svc="${1:?service required}"
+  local envf; envf="$(service_dir "${svc}")/.env"
+  [[ -f "${envf}" ]] || die "missing env: ${envf}"
+  warn "This will print secrets to your terminal history."
+  if ! confirm "Show raw secrets for ${svc}?"; then
+    say "Canceled."
+    return 0
+  fi
+  cat "${envf}"
+}
+
+export_config() {
+  require tar
+  local svc="${1:?service required}"
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  [[ -d "${svc_dir}" ]] || die "service not deployed: ${svc}"
+  local ts out
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  out="${2:-${STORD_BACKUPS_DIR}/${PROG_NAME}-${svc}-config-${ts}.tgz}"
+  mkdir -p "$(dirname "${out}")"
+
+  say "Export config (excluding data) for ${svc}"
+  say "- from: ${svc_dir}"
+  say "- to:   ${out}"
+  if ! confirm "Proceed?"; then
+    say "Canceled."
+    return 0
+  fi
+
+  local items=()
+  [[ -f "${svc_dir}/docker-compose.yml" ]] && items+=("docker-compose.yml")
+  [[ -f "${svc_dir}/.env" ]] && items+=(".env")
+  [[ -d "${svc_dir}/conf" ]] && items+=("conf")
+  [[ -d "${svc_dir}/conf.d" ]] && items+=("conf.d")
+  [[ ${#items[@]} -gt 0 ]] || die "nothing to export"
+
+  (cd "${svc_dir}" && tar -czf "${out}" "${items[@]}")
+  say "Exported: ${out}"
+}
+
+import_config() {
+  require tar
+  local svc="${1:?service required}"
+  local file="${2:?config file required (.tgz)}"
+  [[ -f "${file}" ]] || die "file not found: ${file}"
+
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  mkdir -p "${svc_dir}"
+
+  warn "Importing config will overwrite files like .env / docker-compose.yml, but will NOT touch ./data."
+  say "- service: ${svc}"
+  say "- into:    ${svc_dir}"
+  say "- from:    ${file}"
+  if ! confirm "Proceed with import?"; then
+    say "Canceled."
+    return 0
+  fi
+
+  (cd "${svc_dir}" && tar -xzf "${file}")
+  say "Imported config."
+}
+
+list_services() {
+  ensure_dirs
+  # Portable across GNU/BSD find (avoid -printf).
+  find "${STORD_SERVICES_DIR}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null \
+    -exec basename {} \; | sort
+}
+
+doctor() {
+  say "${PROG_NAME} doctor"
+  say "- version: ${STORD_VERSION}"
+  say "- home:    ${STORD_HOME}"
+  say "- raw url: ${STORD_RAW_URL}"
+  say "- mem:     $(mem_total_mb)MB"
+  say "- suggest: mariadb buffer=$(suggest_mariadb_buffer_pool_mb)MB, mongodb cache=$(suggest_mongodb_cache_mb)MB, redis maxmem=$(suggest_redis_maxmem_mb)MB"
+  say
+  if have docker; then
+    say "docker:    ok ($(docker --version 2>/dev/null || true))"
+  else
+    say "docker:    missing"
+  fi
+  if compose_bin >/dev/null 2>&1; then
+    say "compose:   ok ($(compose_bin))"
+  else
+    say "compose:   missing"
+  fi
+  if have curl; then
+    say "curl:      ok"
+  else
+    say "curl:      missing"
+  fi
+  if have ufw; then
+    say "ufw:       ok"
+  elif have firewall-cmd; then
+    say "firewalld: ok"
+  else
+    say "firewall:  none detected"
+  fi
+  say
+  say "Deployed services:"
+  list_services | sed 's/^/ - /'
+}
+
+firewall_allow() {
+  local port="$1"
+  local ip="$2"
+  if have ufw; then
+    ufw allow from "${ip}" to any port "${port}" proto tcp
+    return 0
+  fi
+  if have firewall-cmd; then
+    firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ip} port port=${port} protocol=tcp accept"
+    firewall-cmd --reload
+    return 0
+  fi
+  die "no supported firewall tool found (ufw or firewalld)"
+}
+
+configure_firewall_menu() {
+  say
+  say "Firewall helper (whitelist IP -> port)."
+  say "This will ADD allow rules; it won't remove existing rules."
+  say
+  local svc ip port
+  svc="$(prompt "Service to allow (mariadb/mongodb/redis/custom)" "")"
+  if [[ "${svc}" == "custom" ]]; then
+    port="$(prompt "Port to allow" "")"
+    [[ "${port}" =~ ^[0-9]+$ ]] || die "invalid port: ${port}"
+  else
+    port="$(svc_host_port "${svc}")"
+  fi
+  ip="$(prompt "Allowed client IPv4 (e.g. 1.2.3.4/32)" "")"
+  [[ -n "${ip}" ]] || die "ip is required"
+  if ! confirm "Allow ${ip} -> ${svc} port ${port}?"; then
+    say "Canceled."
+    return 0
+  fi
+  if ! is_root; then
+    die "firewall changes require root"
+  fi
+  firewall_allow "${port}" "${ip}"
+  say "Rule added."
+}
+
+backup_list_files() {
+  ensure_dirs
+  local svc="${1:-all}"
+  local dir="${STORD_BACKUPS_DIR}"
+  [[ -d "${dir}" ]] || { say "No backups directory: ${dir}"; return 0; }
+
+  local pat=()
+  case "${svc}" in
+    all) pat+=("mariadb-*.sql" "mariadb-*.sql.gz" "mongodb-*.archive" "mongodb-*.archive.gz") ;;
+    mariadb) pat+=("mariadb-*.sql" "mariadb-*.sql.gz") ;;
+    mongodb) pat+=("mongodb-*.archive" "mongodb-*.archive.gz") ;;
+    *) die "usage: ${PROG_NAME} backup files [mariadb|mongodb|all]" ;;
+  esac
+
+  say "Backup files in ${dir}:"
+  local out
+  out="$(
+    for p in "${pat[@]}"; do
+      ls -1t "${dir}/${p}" 2>/dev/null || true
+    done | awk 'NF' || true
+  )"
+  if [[ -n "${out}" ]]; then
+    printf "%s\n" "${out}"
+  else
+    say "(none)"
+  fi
+}
+
+backup_prune() {
+  ensure_dirs
+  local svc="${1:-all}"
+  local days="${2:-}"
+  if [[ -z "${days}" ]]; then
+    days="$(prompt "Delete backups older than N days" "14")"
+  fi
+  [[ "${days}" =~ ^[0-9]+$ ]] || die "days must be an integer"
+
+  local dir="${STORD_BACKUPS_DIR}"
+  [[ -d "${dir}" ]] || { say "No backups directory: ${dir}"; return 0; }
+
+  local patterns=()
+  case "${svc}" in
+    all) patterns+=("mariadb-*.sql" "mariadb-*.sql.gz" "mongodb-*.archive" "mongodb-*.archive.gz") ;;
+    mariadb) patterns+=("mariadb-*.sql" "mariadb-*.sql.gz") ;;
+    mongodb) patterns+=("mongodb-*.archive" "mongodb-*.archive.gz") ;;
+    *) die "usage: ${PROG_NAME} backup prune [mariadb|mongodb|all] [days]" ;;
+  esac
+
+  say "Prune backups older than ${days} days:"
+  say "- dir: ${dir}"
+  say "- svc: ${svc}"
+  warn "This will DELETE files."
+  if ! confirm "Proceed?"; then
+    say "Canceled."
+    return 0
+  fi
+
+  local pat
+  for pat in "${patterns[@]}"; do
+    find "${dir}" -maxdepth 1 -type f -name "${pat}" -mtime +"${days}" -print -delete 2>/dev/null || true
+  done
+  say "Prune complete."
+}
+
+backup_mariadb() {
+  local svc_dir="${STORD_SERVICES_DIR}/mariadb"
+  [[ -f "${svc_dir}/.env" ]] || die "mariadb not deployed"
+  local db rootpw
+  db="$(grep -E '^MARIADB_DATABASE=' "${svc_dir}/.env" | cut -d= -f2-)"
+  rootpw="$(grep -E '^MARIADB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
+  [[ -n "${db}" ]] || die "missing MARIADB_DATABASE"
+  [[ -n "${rootpw}" ]] || die "missing MARIADB_ROOT_PASSWORD"
+
+  local ts out
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if have gzip; then
+    out="${STORD_BACKUPS_DIR}/mariadb-${ts}.sql.gz"
+  else
+    warn "gzip not found; writing uncompressed .sql"
+    out="${STORD_BACKUPS_DIR}/mariadb-${ts}.sql"
+  fi
+  mkdir -p "${STORD_BACKUPS_DIR}"
+
+  say "Backing up mariadb -> ${out}"
+  if [[ "${out}" == *.gz ]]; then
+    docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
+      | gzip -9 > "${out}"
+  else
+    docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
+      > "${out}"
+  fi
+  say "Backup ok."
+}
+
+backup_mongodb() {
+  local svc_dir="${STORD_SERVICES_DIR}/mongodb"
+  [[ -f "${svc_dir}/.env" ]] || die "mongodb not deployed"
+  local user pass
+  user="$(grep -E '^MONGO_INITDB_ROOT_USERNAME=' "${svc_dir}/.env" | cut -d= -f2-)"
+  pass="$(grep -E '^MONGO_INITDB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
+  [[ -n "${user}" ]] || die "missing MONGO_INITDB_ROOT_USERNAME"
+  [[ -n "${pass}" ]] || die "missing MONGO_INITDB_ROOT_PASSWORD"
+
+  local ts out
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if have gzip; then
+    out="${STORD_BACKUPS_DIR}/mongodb-${ts}.archive.gz"
+  else
+    warn "gzip not found; writing uncompressed .archive"
+    out="${STORD_BACKUPS_DIR}/mongodb-${ts}.archive"
+  fi
+  mkdir -p "${STORD_BACKUPS_DIR}"
+
+  say "Backing up mongodb -> ${out}"
+  if [[ "${out}" == *.gz ]]; then
+    docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
+      | gzip -9 > "${out}"
+  else
+    docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
+      > "${out}"
+  fi
+  say "Backup ok."
+}
+
+backup() {
+  local sub="${1:-}"
+  case "${sub}" in
+    mariadb) backup_mariadb ;;
+    mongodb) backup_mongodb ;;
+    redis) die "redis backup: use volume snapshot (AOF/RDB in ./data)" ;;
+    files) shift; backup_list_files "${1:-all}" ;;
+    prune) shift; backup_prune "${1:-all}" "${2:-}" ;;
+    enable|disable|list) backup_schedule "$@" ;;
+    *) die "usage: ${PROG_NAME} backup {mariadb|mongodb} | backup {files|prune} [svc] | backup {enable|disable|list} ..." ;;
+  esac
+}
+
+prog_bin() {
+  local p
+  p="$(command -v "${PROG_NAME}" 2>/dev/null || true)"
+  if [[ -n "${p}" ]]; then
+    echo "${p}"
+    return 0
+  fi
+  local self="${BASH_SOURCE[0]:-}"
+  if [[ -n "${self}" && -f "${self}" ]]; then
+    echo "${self}"
+    return 0
+  fi
+  die "${PROG_NAME} is not in PATH; install it first (run menu -> Install / update)"
+}
+
+cron_get() {
+  ensure_crontab
+  crontab -l 2>/dev/null || true
+}
+
+cron_set() {
+  ensure_crontab
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp}"' RETURN
+  if [[ $# -gt 0 ]]; then
+    printf "%s\n" "$@" > "${tmp}"
+  else
+    cat > "${tmp}"
+  fi
+  crontab "${tmp}"
+}
+
+cron_remove_marker() {
+  local marker="$1"
+  cron_get | grep -v "${marker}" || true
+}
+
+backup_schedule() {
+  local action="${1:-}"
+  shift || true
+
+  local marker_prefix="# ${PROG_NAME}:backup:"
+  case "${action}" in
+    list)
+      cron_get | grep "${marker_prefix}" || true
+      ;;
+    enable)
+      local svc="${1:?service required (mariadb|mongodb)}"
+      shift || true
+      case "${svc}" in mariadb|mongodb) ;; *) die "unsupported service for schedule: ${svc}" ;; esac
+
+      local hh mm
+      hh="$(prompt "Hour (0-23)" "3")"
+      mm="$(prompt "Minute (0-59)" "30")"
+      [[ "${hh}" =~ ^[0-9]+$ ]] && [[ "${mm}" =~ ^[0-9]+$ ]] || die "hour/minute must be integers"
+
+      local bin; bin="$(prog_bin)"
+      local marker="${marker_prefix}${svc}"
+      local logf="${STORD_LOG_DIR}/backup-${svc}.log"
+      local line="${mm} ${hh} * * * sh -c 'mkdir -p \"${STORD_LOG_DIR}\"; STORD_HOME=\"${STORD_HOME}\" \"${bin}\" backup ${svc} >> \"${logf}\" 2>&1' ${marker}"
+      say "Add cron:"
+      say "  ${line}"
+      if ! confirm "Apply this cron entry?"; then
+        say "Canceled."
+        return 0
+      fi
+      if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
+        die "refusing to modify crontab in non-interactive mode (use --yes)"
+      fi
+      { cron_remove_marker "${marker}"; echo "${line}"; } | cron_set
+      say "Backup schedule enabled for ${svc}."
+      ;;
+    disable)
+      local svc="${1:?service required (mariadb|mongodb)}"
+      local marker="${marker_prefix}${svc}"
+      if ! confirm "Remove cron entry for ${svc} backups?"; then
+        say "Canceled."
+        return 0
+      fi
+      if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
+        die "refusing to modify crontab in non-interactive mode (use --yes)"
+      fi
+      cron_remove_marker "${marker}" | cron_set
+      say "Backup schedule disabled for ${svc}."
+      ;;
+    *)
+      die "usage: ${PROG_NAME} backup {enable|disable|list}"
+      ;;
+  esac
+}
+
+restore_mariadb() {
+  local file="${1:?backup file required (.sql or .sql.gz)}"
+  [[ -f "${file}" ]] || die "file not found: ${file}"
+  local db rootpw
+  db="$(env_get mariadb MARIADB_DATABASE || true)"
+  rootpw="$(env_get mariadb MARIADB_ROOT_PASSWORD || true)"
+  [[ -n "${db}" ]] || die "missing mariadb config"
+  warn "This will overwrite data in database: ${db}"
+  if ! confirm "Restore MariaDB from ${file}?"; then
+    say "Canceled."
+    return 0
+  fi
+  local catcmd="cat"
+  if [[ "${file}" == *.gz ]]; then
+    have gzip || die "gzip is required to restore .gz backups"
+    catcmd="gzip -dc"
+  fi
+  # shellcheck disable=SC2086
+  ${catcmd} "${file}" | docker exec -i "$(container_name mariadb)" sh -c "mysql -uroot -p\"${rootpw}\" \"${db}\""
+  say "Restore complete."
+}
+
+restore_mongodb() {
+  local file="${1:?backup file required (.archive.gz or .archive)}"
+  [[ -f "${file}" ]] || die "file not found: ${file}"
+  local user pass
+  user="$(env_get mongodb MONGO_INITDB_ROOT_USERNAME || true)"
+  pass="$(env_get mongodb MONGO_INITDB_ROOT_PASSWORD || true)"
+  [[ -n "${user}" && -n "${pass}" ]] || die "missing mongodb config"
+  warn "This will restore MongoDB data from backup."
+  if ! confirm "Restore MongoDB from ${file}?"; then
+    say "Canceled."
+    return 0
+  fi
+  local drop
+  drop="$(prompt "Drop existing collections first? (yes/no)" "yes")"
+  local drop_flag=""
+  if [[ "${drop,,}" == "yes" || "${drop,,}" == "y" ]]; then drop_flag="--drop"; fi
+
+  local catcmd="cat"
+  if [[ "${file}" == *.gz ]]; then
+    have gzip || die "gzip is required to restore .gz backups"
+    catcmd="gzip -dc"
+  fi
+  # shellcheck disable=SC2086
+  ${catcmd} "${file}" | docker exec -i "$(container_name mongodb)" sh -c "mongorestore --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive ${drop_flag}"
+  say "Restore complete."
+}
+
+restore_service() {
+  local svc="${1:?service required}"
+  local file="${2:?backup file required}"
+  case "${svc}" in
+    mariadb) restore_mariadb "${file}" ;;
+    mongodb) restore_mongodb "${file}" ;;
+    *) die "usage: ${PROG_NAME} restore {mariadb|mongodb} <file>" ;;
+  esac
+}
+
+self_update() {
+  local url="${1:-${STORD_RAW_URL}}"
+  require curl
+  local target
+  target="$(command -v "${PROG_NAME}" || true)"
+  [[ -n "${target}" ]] || die "${PROG_NAME} not found in PATH"
+  say "Updating ${PROG_NAME}:"
+  say "- from: ${url}"
+  say "- to:   ${target}"
+  say
+  if ! confirm "Proceed with update?"; then
+    say "Canceled."
+    return 0
+  fi
+  if [[ ! -w "${target}" ]]; then
+    if is_root; then
+      :
+    else
+      die "no permission to write ${target} (run as root or reinstall to ~/.local/bin)"
+    fi
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp}"' RETURN
+  curl -fsSL "${url}" -o "${tmp}"
+  chmod +x "${tmp}"
+  mv -f "${tmp}" "${target}"
+  say "Updated."
+}
+
+install_self() {
+  require curl
+
+  local target_dir="${1:-}"
+  if [[ -z "${target_dir}" ]]; then
+    if is_root; then
+      target_dir="/usr/local/bin"
+    else
+      target_dir="${HOME}/.local/bin"
+    fi
+  fi
+
+  mkdir -p "${target_dir}"
+  local target="${target_dir}/${PROG_NAME}"
+
+  say "Install / update ${PROG_NAME}"
+  say "- from: ${STORD_RAW_URL}"
+  say "- to:   ${target}"
+  say
+  if ! confirm "Proceed?"; then
+    say "Canceled."
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp}"' RETURN
+
+  # If we are running from a real file (e.g. downloaded via wget), copy self to avoid network.
+  local self="${BASH_SOURCE[0]:-}"
+  if [[ -n "${self}" && -f "${self}" ]]; then
+    cp -f "${self}" "${tmp}"
+  else
+    curl -fsSL "${STORD_RAW_URL}" -o "${tmp}"
+  fi
+
+  head -n 1 "${tmp}" | grep -q "bash" || die "downloaded script does not look like bash"
+  chmod +x "${tmp}"
+
+  if [[ -e "${target}" && ! -w "${target}" ]]; then
+    die "no permission to write ${target} (run as root or choose a writable dir)"
+  fi
+  mv -f "${tmp}" "${target}"
+
+  say "Installed: ${target}"
+  if [[ ":$PATH:" != *":${target_dir}:"* ]]; then
+    say
+    say "PATH hint:"
+    say "  export PATH=\"${target_dir}:\$PATH\""
+  fi
+}
+
+is_piped_run() {
+  # Heuristic: running via `curl ... | bash` means $0 is bash and there's no source file.
+  [[ "${0##*/}" == "bash" || "${0##*/}" == "sh" ]] && [[ ! -f "${BASH_SOURCE[0]:-}" ]]
+}
+
+bootstrap_menu() {
+  local cmd="${1:-menu}"
+  if [[ "${cmd}" != "menu" && -n "${cmd}" ]]; then
+    return 0
+  fi
+  # For the "single script" experience: allow `curl .../stord | bash`
+  # to install this tool to PATH, then run the installed binary.
+  if [[ "${STORD_BOOTSTRAP_DONE:-}" == "1" ]]; then
+    return 0
+  fi
+  if ! is_piped_run; then
+    return 0
+  fi
+
+  local existing
+  existing="$(command -v "${PROG_NAME}" || true)"
+  if [[ -n "${existing}" ]]; then
+    export STORD_BOOTSTRAP_DONE=1
+    exec "${existing}" menu
+  fi
+
+  install_self ""
+  local installed
+  installed="$(command -v "${PROG_NAME}" || true)"
+  if [[ -z "${installed}" ]]; then
+    # Try default locations
+    if is_root && [[ -x "/usr/local/bin/${PROG_NAME}" ]]; then
+      installed="/usr/local/bin/${PROG_NAME}"
+    elif [[ -x "${HOME}/.local/bin/${PROG_NAME}" ]]; then
+      installed="${HOME}/.local/bin/${PROG_NAME}"
+    else
+      die "installed ${PROG_NAME} but it's not in PATH; re-run using the printed PATH hint"
+    fi
+  fi
+
+  export STORD_BOOTSTRAP_DONE=1
+  exec "${installed}" menu
+}
+
+menu_choice_num() {
+  local label="${1:-Select}"
+  local def="${2:-}"
+  local out
+  while true; do
+    if [[ -n "${def}" ]]; then
+      read -r -u "${STORD_INPUT_FD}" -p "${label} [${def}]: " out || true
+      out="${out:-$def}"
+    else
+      read -r -u "${STORD_INPUT_FD}" -p "${label}: " out || true
+    fi
+    [[ -n "${out}" ]] || continue
+    if [[ "${out}" =~ ^[0-9]+$ ]]; then
+      printf "%s" "${out}"
+      return 0
+    fi
+    say "Please enter a number."
+  done
+}
+
+menu_service_actions() {
+  local svc="${1:?service required (mariadb|mongodb|redis|all)}"
+  while true; do
+    say
+    say "${PROG_NAME} — service: ${svc}"
+    say "1) Status"
+    say "2) Logs"
+    say "3) Restart"
+    say "4) Stop"
+    say "5) Start"
+    say "6) Config (masked)"
+    say "7) DSN"
+    say "8) Secrets (DANGEROUS)"
+    say "9) Backup now"
+    say "10) Restore"
+    say "11) Export config (tgz)"
+    say "12) Import config (tgz)"
+    say "13) Remove service (stop)"
+    say "14) Purge service (DELETE data)"
+    say "0) Back"
+    say
+
+    local act
+    act="$(menu_choice_num "Select" "1")"
+    case "${act}" in
+      1)
+        if [[ "${svc}" == "all" ]]; then status_all; else status_service "${svc}"; fi
+        ;;
+      2)
+        if [[ "${svc}" == "all" ]]; then
+          logs_all
+        else
+          logs_service "${svc}"
+        fi
+        ;;
+      3)
+        if [[ "${svc}" == "all" ]]; then restart_all; else restart_service "${svc}"; fi
+        ;;
+      4)
+        if [[ "${svc}" == "all" ]]; then stop_all; else stop_service "${svc}"; fi
+        ;;
+      5)
+        if [[ "${svc}" == "all" ]]; then start_all; else start_service "${svc}"; fi
+        ;;
+      6)
+        if [[ "${svc}" == "all" ]]; then show_env_all; else show_env "${svc}"; fi
+        ;;
+      7)
+        if [[ "${svc}" == "all" ]]; then dsn_all; else dsn_service "${svc}"; fi
+        ;;
+      8)
+        if [[ "${svc}" == "all" ]]; then
+          warn "Secrets are per-service; choose a specific service."
+        else
+          secrets_service "${svc}"
+        fi
+        ;;
+      9)
+        case "${svc}" in
+          mariadb|mongodb) backup "${svc}" ;;
+          all) warn "Backup now is per-service; choose mariadb/mongodb." ;;
+          redis) warn "Redis backup: use volume snapshot (AOF/RDB in ./data)." ;;
+          *) warn "Unknown service: ${svc}" ;;
+        esac
+        ;;
+      10)
+        case "${svc}" in
+          mariadb|mongodb)
+            local f
+            f="$(prompt "Backup file path" "")"
+            restore_service "${svc}" "${f}"
+            ;;
+          *) warn "Restore supported only for mariadb/mongodb." ;;
+        esac
+        ;;
+      11)
+        if [[ "${svc}" == "all" ]]; then
+          warn "Export config is per-service; choose a specific service."
+        else
+          local o
+          o="$(prompt "Output file (optional)" "")"
+          if [[ -n "${o}" ]]; then export_config "${svc}" "${o}"; else export_config "${svc}"; fi
+        fi
+        ;;
+      12)
+        if [[ "${svc}" == "all" ]]; then
+          warn "Import config is per-service; choose a specific service."
+        else
+          local cf
+          cf="$(prompt "Config tgz path" "")"
+          import_config "${svc}" "${cf}"
+        fi
+        ;;
+      13)
+        if [[ "${svc}" == "all" ]]; then
+          warn "Remove is per-service; choose a specific service."
+        else
+          remove_service "${svc}"
+        fi
+        ;;
+      14)
+        if [[ "${svc}" == "all" ]]; then
+          warn "Purge is per-service; choose a specific service."
+        else
+          purge_service "${svc}"
+        fi
+        ;;
+      0) return 0 ;;
+      *) say "Unknown selection." ;;
+    esac
+  done
+}
+
+menu_select_service() {
+  while true; do
+    say
+    say "Select service:"
+    say "1) MariaDB"
+    say "2) MongoDB"
+    say "3) Redis"
+    say "4) All"
+    say "5) List deployed"
+    say "0) Back"
+    say
+    local s
+    s="$(menu_choice_num "Select" "1")"
+    case "${s}" in
+      1) echo "mariadb"; return 0 ;;
+      2) echo "mongodb"; return 0 ;;
+      3) echo "redis"; return 0 ;;
+      4) echo "all"; return 0 ;;
+      5)
+        say "Deployed:"
+        list_services | sed 's/^/ - /'
+        ;;
+      0) echo ""; return 0 ;;
+      *) say "Unknown selection." ;;
+    esac
+  done
+}
+
+menu_deploy() {
+  while true; do
+    say
+    say "Deploy:"
+    say "1) MariaDB"
+    say "2) MongoDB"
+    say "3) Redis"
+    say "0) Back"
+    say
+    local d
+    d="$(menu_choice_num "Select" "1")"
+    case "${d}" in
+      1) deploy mariadb ;;
+      2) deploy mongodb ;;
+      3) deploy redis ;;
+      0) return 0 ;;
+      *) say "Unknown selection." ;;
+    esac
+  done
+}
+
+menu_backups() {
+  while true; do
+    say
+    say "Backups:"
+    say "1) List backup files"
+    say "2) Prune old backups"
+    say "3) Backup schedule (enable/disable/list)"
+    say "0) Back"
+    say
+    local b
+    b="$(menu_choice_num "Select" "1")"
+    case "${b}" in
+      1)
+        local s
+        s="$(prompt "Service (mariadb/mongodb/all)" "all")"
+        backup files "${s}"
+        ;;
+      2)
+        local s d
+        s="$(prompt "Service (mariadb/mongodb/all)" "all")"
+        d="$(prompt "Retain last N days" "14")"
+        backup prune "${s}" "${d}"
+        ;;
+      3)
+        local a s
+        a="$(prompt "Action (enable/disable/list)" "list")"
+        if [[ "${a}" == "list" ]]; then
+          backup list
+        else
+          s="$(prompt "Service (mariadb/mongodb)" "")"
+          backup "${a}" "${s}"
+        fi
+        ;;
+      0) return 0 ;;
+      *) say "Unknown selection." ;;
+    esac
+  done
+}
+
+menu() {
+  ensure_dirs
+  maybe_offer_update
+
+  while true; do
+    say
+    say "${PROG_NAME} ${STORD_VERSION} — ${STORD_HOME}"
+    say "1) Manage a service (status/logs/...)"
+    say "2) Deploy services"
+    say "3) Backups"
+    say "4) Firewall whitelist helper"
+    say "5) Doctor (checks)"
+    say "6) Install / update ${PROG_NAME}"
+    say "7) Self-update ${PROG_NAME} (download raw)"
+    say "8) Check for updates"
+    say "0) Exit"
+    say
+
+    local top
+    top="$(menu_choice_num "Select" "1")"
+    case "${top}" in
+      1)
+        local svc
+        svc="$(menu_select_service)"
+        [[ -n "${svc}" ]] || continue
+        menu_service_actions "${svc}"
+        ;;
+      2) menu_deploy ;;
+      3) menu_backups ;;
+      4) configure_firewall_menu ;;
+      5) doctor ;;
+      6) install_self "" ;;
+      7) self_update ;;
+      8) check_update || true ;;
+      0) exit 0 ;;
+      *) say "Unknown selection." ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+${PROG_NAME} - single-node storage deploy helper
+
+Usage:
+  ${PROG_NAME}                # interactive menu (auto-installs if piped)
+  ${PROG_NAME} [--yes] [--non-interactive] <command> ...
+  ${PROG_NAME} menu
+  ${PROG_NAME} doctor
+  ${PROG_NAME} check-update
+  ${PROG_NAME} install [dir]
+  ${PROG_NAME} deploy <svc>   # mariadb|mongodb|redis
+  ${PROG_NAME} start <svc|all>
+  ${PROG_NAME} stop <svc|all>
+  ${PROG_NAME} restart <svc|all>
+  ${PROG_NAME} status [svc|all]       # default: all
+  ${PROG_NAME} logs <svc|all>
+  ${PROG_NAME} config [svc|all]       # show masked env (default: all)
+  ${PROG_NAME} secrets <svc>          # show raw env (DANGEROUS)
+  ${PROG_NAME} dsn [svc|all]          # print connection string template (default: all)
+  ${PROG_NAME} backup mariadb|mongodb
+  ${PROG_NAME} backup files [svc]     # list local backup files
+  ${PROG_NAME} backup prune [svc] [days]
+  ${PROG_NAME} backup enable <svc>    # schedule daily backup via crontab
+  ${PROG_NAME} backup disable <svc>
+  ${PROG_NAME} backup list
+  ${PROG_NAME} restore <svc> <file>   # mariadb|mongodb
+  ${PROG_NAME} remove <svc>           # stop containers
+  ${PROG_NAME} purge <svc>            # stop + delete data dir
+  ${PROG_NAME} export-config <svc> [out.tgz]
+  ${PROG_NAME} import-config <svc> <file.tgz>
+  ${PROG_NAME} config-path <svc>
+  ${PROG_NAME} config-edit <svc>
+  ${PROG_NAME} firewall       # whitelist helper (root)
+  ${PROG_NAME} self-update [url]
+  ${PROG_NAME} --version
+EOF
+}
+
+main() {
+  local cmd="${1:-menu}"
+  case "${cmd}" in
+    -v|--version) say "${STORD_VERSION}"; exit 0 ;;
+    menu) shift; menu "$@" ;;
+    doctor) shift; doctor "$@" ;;
+    check-update) shift; check_update ;;
+    install) shift; install_self "${1:-}" ;;
+    deploy) shift; deploy "$@" ;;
+    start)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then start_all; else start_service "${1}"; fi
+      ;;
+    stop)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then stop_all; else stop_service "${1}"; fi
+      ;;
+    restart)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then restart_all; else restart_service "${1}"; fi
+      ;;
+    status)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then status_all; else status_service "${1}"; fi
+      ;;
+    logs)
+      shift
+      if [[ "${1:-}" == "all" ]]; then logs_all; else logs_service "${1:?service required}"; fi
+      ;;
+    config)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then show_env_all; else show_env "${1}"; fi
+      ;;
+    secrets) shift; secrets_service "${1:?service required}" ;;
+    dsn)
+      shift
+      if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then dsn_all; else dsn_service "${1}"; fi
+      ;;
+    backup) shift; backup "$@" ;;
+    restore) shift; restore_service "${1:?service required}" "${2:?backup file required}" ;;
+    remove) shift; remove_service "${1:?service required}" ;;
+    purge) shift; purge_service "${1:?service required}" ;;
+    export-config) shift; export_config "${1:?service required}" "${2:-}" ;;
+    import-config) shift; import_config "${1:?service required}" "${2:?config file required}" ;;
+    config-path) shift; config_path "${1:?service required}" ;;
+    config-edit) shift; config_edit "${1:?service required}" ;;
+    firewall) shift; configure_firewall_menu ;;
+    self-update) shift; self_update "$@" ;;
+    help|-h|--help) usage ;;
+    *)
+      # Default to menu for unknown (friendlier).
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+entry() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes)
+        STORD_ASSUME_YES=1
+        shift
+        ;;
+      --non-interactive)
+        STORD_NON_INTERACTIVE=1
+        shift
+        ;;
+      --debug)
+        STORD_DEBUG=1
+        set -x
+        shift
+        ;;
+      --quiet)
+        STORD_QUIET=1
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  bootstrap_menu "${1:-menu}"
+  main "$@"
+}
+
+entry "$@"
