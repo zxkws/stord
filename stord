@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.5"
+STORD_VERSION="0.2.6"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
