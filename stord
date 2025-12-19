@@ -1704,6 +1704,38 @@ uninstall_script() {
   say "已删除：${bin}"
 }
 
+uninstall_all_services() {
+  local any=0 svc
+  say "将卸载所有服务（仅停止容器，保留数据与配置目录）。"
+  if ! confirm "继续？"; then
+    say "已取消。"
+    return 0
+  fi
+  while IFS= read -r svc; do
+    [[ -n "${svc}" ]] || continue
+    any=1
+    local svc_dir; svc_dir="$(service_dir "${svc}")"
+    [[ -d "${svc_dir}" ]] || { warn "服务目录不存在：${svc_dir}"; continue; }
+    remove_service "${svc}" || true
+  done < <(list_services)
+  if [[ "${any}" == "0" ]]; then
+    say "暂无已部署服务。"
+  fi
+}
+
+uninstall_single_service() {
+  local svc="${1:-}"
+  if [[ -z "${svc}" ]]; then
+    say "已部署服务："
+    list_services | sed 's/^/ - /'
+    svc="$(prompt "服务名" "")"
+  fi
+  [[ -n "${svc}" ]] || { say "已取消。"; return 0; }
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  [[ -d "${svc_dir}" ]] || { warn "服务未部署：${svc}"; return 0; }
+  remove_service "${svc}"
+}
+
 uninstall_all() {
   local -a items=()
   local -a service_items=()
@@ -1852,6 +1884,8 @@ menu_uninstall() {
     say "卸载/清理："
     say "1) 仅卸载脚本"
     say "2) 卸载脚本 + 所有服务与数据"
+    say "3) 仅卸载所有服务（保留数据）"
+    say "4) 卸载单个服务（保留数据）"
     say "0) 返回"
     say
     local u
@@ -1859,6 +1893,8 @@ menu_uninstall() {
     case "${u}" in
       1) uninstall_script ;;
       2) uninstall_all ;;
+      3) uninstall_all_services ;;
+      4) uninstall_single_service ;;
       0) return 0 ;;
       *) say "未知选项。" ;;
     esac
@@ -2206,7 +2242,7 @@ ${PROG_NAME} - 单机存储部署工具
   ${PROG_NAME} config-path <svc>
   ${PROG_NAME} config-edit <svc>
   ${PROG_NAME} firewall              # 防火墙白名单（root）
-  ${PROG_NAME} uninstall [script|all]
+  ${PROG_NAME} uninstall [script|all|services|<svc>]
   ${PROG_NAME} self-update [url]
   ${PROG_NAME} --version
 EOF
@@ -2265,8 +2301,9 @@ main() {
       case "${1:-}" in
         script) uninstall_script ;;
         all) uninstall_all ;;
+        services) uninstall_all_services ;;
         "" ) menu_uninstall ;;
-        *) die "用法：${PROG_NAME} uninstall [script|all]" ;;
+        *) uninstall_single_service "${1}" ;;
       esac
       ;;
     help|-h|--help) usage ;;
