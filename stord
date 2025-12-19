@@ -2252,7 +2252,7 @@ main() {
   local cmd="${1:-menu}"
   case "${cmd}" in
     -v|--version) say "${STORD_VERSION}"; exit 0 ;;
-    menu) shift; menu "$@" ;;
+    menu) shift || true; menu "$@" ;;
     doctor) shift; doctor "$@" ;;
     check-update) shift; check_update ;;
     install) shift; install_self "${1:-}" ;;
