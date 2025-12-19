@@ -52,6 +52,12 @@ sudo -E stord
 - 如需“定时备份”：需要 `crontab`（脚本会检测并提示安装），并确保 cron 服务在运行
 - 如需“防火墙白名单助手”：需要 `ufw` 或 `firewalld`（并且必须 root）
 
+Docker 安装提示：
+- `get.docker.com` 只支持主流发行版；遇到不支持的发行版会提示并中止安装。
+- 可用环境变量自定义镜像/代理：
+  - `STORD_DOCKER_MIRROR`：传给 `get.docker.com` 的 `--mirror` 参数
+  - `STORD_HTTP_PROXY` / `STORD_HTTPS_PROXY` / `STORD_NO_PROXY`：为安装过程设置代理
+
 ## 快速开始（推荐流程）
 
 1) 安装：`curl ... | sudo bash`

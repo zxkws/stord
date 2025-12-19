@@ -72,6 +72,46 @@ require() {
   have "${cmd}" || die "缺少依赖：${cmd}"
 }
 
+os_release_value() {
+  local key="$1"
+  local val=""
+  if [[ -r /etc/os-release ]]; then
+    val="$(grep -E "^${key}=" /etc/os-release | head -n 1 | cut -d= -f2- | tr -d '"')"
+  fi
+  printf "%s" "${val}"
+}
+
+docker_install_supported() {
+  local id like
+  id="$(os_release_value ID)"
+  like="$(os_release_value ID_LIKE)"
+  case " ${id} ${like} " in
+    *" ubuntu "*|*" debian "*|*" raspbian "*|*" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*|*" ol "*|*" amzn "*|*" sles "*|*" opensuse "*|*" suse "*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+docker_proxy_env() {
+  local http_proxy_val="${STORD_HTTP_PROXY:-${http_proxy:-${HTTP_PROXY:-}}}"
+  local https_proxy_val="${STORD_HTTPS_PROXY:-${https_proxy:-${HTTPS_PROXY:-}}}"
+  local no_proxy_val="${STORD_NO_PROXY:-${no_proxy:-${NO_PROXY:-}}}"
+  local -a envs=()
+  if [[ -n "${http_proxy_val}" ]]; then
+    envs+=("http_proxy=${http_proxy_val}" "HTTP_PROXY=${http_proxy_val}")
+  fi
+  if [[ -n "${https_proxy_val}" ]]; then
+    envs+=("https_proxy=${https_proxy_val}" "HTTPS_PROXY=${https_proxy_val}")
+  fi
+  if [[ -n "${no_proxy_val}" ]]; then
+    envs+=("no_proxy=${no_proxy_val}" "NO_PROXY=${no_proxy_val}")
+  fi
+  printf "%s\n" "${envs[@]}"
+}
+
 ver_cmp() {
   # Compare two dotted versions (e.g. 0.2.10 vs 0.2.2).
   # Prints -1, 0, or 1.
@@ -372,12 +412,41 @@ ensure_docker() {
   say "未检测到 Docker。"
   say "建议安装：Docker Engine + compose 插件。"
   say
+  if ! docker_install_supported; then
+    local id like
+    id="$(os_release_value ID)"
+    like="$(os_release_value ID_LIKE)"
+    warn "当前发行版不在 get.docker.com 支持范围内。"
+    say "ID=${id:-unknown}  ID_LIKE=${like:-unknown}"
+    say "请使用发行版/云厂商提供的 Docker 安装方式。"
+    return 1
+  fi
   if confirm "使用官方脚本（get.docker.com）安装 Docker？"; then
     require curl
-    curl -fsSL https://get.docker.com | sh
+    local tmp mirror
+    tmp="$(mktemp)"
+    mirror="${STORD_DOCKER_MIRROR:-}"
+    local -a envs mirror_args
+    mapfile -t envs < <(docker_proxy_env)
+    if [[ -n "${mirror}" ]]; then
+      mirror_args=(--mirror "${mirror}")
+      say "使用镜像源：${mirror}"
+    fi
+    if ! env "${envs[@]}" curl -fsSL https://get.docker.com -o "${tmp}"; then
+      warn "下载 Docker 安装脚本失败（可能是网络或镜像问题）。"
+      rm -f "${tmp}"
+      return 1
+    fi
+    if ! env "${envs[@]}" sh "${tmp}" "${mirror_args[@]}"; then
+      warn "Docker 安装失败（可能是网络/镜像/代理问题）。"
+      rm -f "${tmp}"
+      return 1
+    fi
+    rm -f "${tmp}"
     say "Docker 已安装。你可能需要重新登录或执行：sudo usermod -aG docker $USER"
   else
-    die "必须先安装 Docker"
+    warn "未安装 Docker，已取消。"
+    return 1
   fi
 }
 
@@ -632,8 +701,8 @@ select_port() {
 
 deploy_mariadb() {
   ensure_dirs
-  ensure_docker
-  ensure_compose
+  ensure_docker || return 1
+  ensure_compose || return 1
 
   local svc="mariadb"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
@@ -732,8 +801,8 @@ collation-server=utf8mb4_unicode_ci
 
 deploy_mongodb() {
   ensure_dirs
-  ensure_docker
-  ensure_compose
+  ensure_docker || return 1
+  ensure_compose || return 1
 
   local svc="mongodb"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
@@ -826,8 +895,8 @@ processManagement:
 
 deploy_redis() {
   ensure_dirs
-  ensure_docker
-  ensure_compose
+  ensure_docker || return 1
+  ensure_compose || return 1
 
   local svc="redis"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
@@ -2009,9 +2078,9 @@ menu_deploy() {
     local d
     d="$(menu_choice_num "选择" "1")"
     case "${d}" in
-      1) deploy mariadb ;;
-      2) deploy mongodb ;;
-      3) deploy redis ;;
+      1) deploy mariadb || true ;;
+      2) deploy mongodb || true ;;
+      3) deploy redis || true ;;
       0) return 0 ;;
       *) say "未知选项。" ;;
     esac
