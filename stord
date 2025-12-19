@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.4"
+STORD_VERSION="0.2.5"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -21,6 +21,12 @@ fi
 
 is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
 
+require_root() {
+  if ! is_root; then
+    die "需要以 root 用户运行（请使用 sudo 或切换到 root）"
+  fi
+}
+
 default_home() {
   echo "/opt/${PROG_NAME}"
 }
@@ -30,6 +36,7 @@ STORD_SERVICES_DIR="${STORD_SERVICES_DIR:-${STORD_HOME}/services}"
 STORD_BACKUPS_DIR="${STORD_BACKUPS_DIR:-${STORD_HOME}/backups}"
 STORD_STATE_DIR="${STORD_STATE_DIR:-${STORD_HOME}/state}"
 STORD_LOG_DIR="${STORD_LOG_DIR:-${STORD_HOME}/logs}"
+STORD_RECORD_FILE="${STORD_RECORD_FILE:-${STORD_STATE_DIR}/install-records}"
 
 umask 077
 
@@ -42,7 +49,7 @@ on_error() {
   local code=$?
   local line="${BASH_LINENO[0]:-?}"
   local cmd="${BASH_COMMAND:-?}"
-  printf "error: failed at line %s: %s\n" "${line}" "${cmd}" >&2
+  printf "错误：第 %s 行失败：%s\n" "${line}" "${cmd}" >&2
   exit "${code}"
 }
 trap on_error ERR
@@ -51,8 +58,8 @@ say() {
   [[ "${STORD_QUIET}" == "1" ]] && return 0
   printf "%s\n" "$*"
 }
-warn() { printf "warn: %s\n" "$*" >&2; }
-die() { printf "error: %s\n" "$*" >&2; exit 1; }
+warn() { printf "警告：%s\n" "$*" >&2; }
+die() { printf "错误：%s\n" "$*" >&2; exit 1; }
 
 if [[ "${STORD_DEBUG}" == "1" ]]; then
   set -x
@@ -62,7 +69,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 require() {
   local cmd="$1"
-  have "${cmd}" || die "missing dependency: ${cmd}"
+  have "${cmd}" || die "缺少依赖：${cmd}"
 }
 
 ver_cmp() {
@@ -98,21 +105,21 @@ check_update() {
   local rv
   rv="$(remote_version || true)"
   if [[ -z "${rv}" ]]; then
-    say "Update check: unable to determine remote version."
+    say "更新检查：无法获取远端版本。"
     return 0
   fi
-  say "Local:  ${STORD_VERSION}"
-  say "Remote: ${rv}"
+  say "本地：${STORD_VERSION}"
+  say "远端：${rv}"
   if [[ "$(ver_cmp "${STORD_VERSION}" "${rv}")" -lt 0 ]]; then
-    say "Update available."
+    say "发现新版本。"
     return 0
   fi
-  say "Up to date."
+  say "已是最新。"
   return 0
 }
 
 confirm() {
-  local prompt="${1:-Continue?}"
+  local prompt="${1:-继续？}"
   local ans
   while true; do
     if [[ "${STORD_ASSUME_YES}" == "1" ]]; then
@@ -121,12 +128,12 @@ confirm() {
     if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
       return 1
     fi
-    read -r -u "${STORD_INPUT_FD}" -p "${prompt} [y/N] " ans || true
-    ans="${ans:-N}"
+    read -r -u "${STORD_INPUT_FD}" -p "${prompt} [Y/n] " ans || true
+    ans="${ans:-Y}"
     case "${ans,,}" in
-      y|yes) return 0 ;;
-      n|no) return 1 ;;
-      *) say "Please answer y or n." ;;
+      y|yes|是|好|1|true) return 0 ;;
+      n|no|否|不|0|false) return 1 ;;
+      *) say "请输入 y 或 n。" ;;
     esac
   done
 }
@@ -140,7 +147,7 @@ prompt() {
       printf "%s" "${def}"
       return 0
     fi
-    die "non-interactive mode requires defaults: ${label}"
+    die "非交互模式需要默认值：${label}"
   fi
   if [[ -n "${def}" ]]; then
     read -r -u "${STORD_INPUT_FD}" -p "${label} [${def}]: " out || true
@@ -187,38 +194,52 @@ maybe_offer_update() {
   [[ -n "${rv}" ]] || return 0
   if [[ "$(ver_cmp "${STORD_VERSION}" "${rv}")" -lt 0 ]]; then
     say
-    say "Update available: ${STORD_VERSION} -> ${rv}"
-    if confirm "Update ${PROG_NAME} now?"; then
+    say "发现新版本：${STORD_VERSION} -> ${rv}"
+    if confirm "现在更新 ${PROG_NAME}？"; then
       (STORD_ASSUME_YES=1 self_update)
       say
     fi
   fi
 }
 
+record_init() {
+  mkdir -p "$(dirname "${STORD_RECORD_FILE}")"
+  touch "${STORD_RECORD_FILE}"
+}
+
+record_add() {
+  local type="$1" path="$2" desc="${3:-}"
+  [[ -n "${path}" ]] || return 0
+  record_init
+  if ! grep -Fq "^${type}|${path}|" "${STORD_RECORD_FILE}" 2>/dev/null; then
+    printf "%s|%s|%s\n" "${type}" "${path}" "${desc}" >> "${STORD_RECORD_FILE}"
+  fi
+}
+
+record_list() {
+  [[ -f "${STORD_RECORD_FILE}" ]] || return 0
+  grep -v '^[[:space:]]*$' "${STORD_RECORD_FILE}" || true
+}
+
+record_remove_path() {
+  local path="$1"
+  [[ -f "${STORD_RECORD_FILE}" ]] || return 0
+  local tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v p="${path}" 'NF && $2!=p {print}' "${STORD_RECORD_FILE}" > "${tmp}"
+  mv -f "${tmp}" "${STORD_RECORD_FILE}"
+}
+
 ensure_dirs() {
   if mkdir -p "${STORD_SERVICES_DIR}" "${STORD_BACKUPS_DIR}" "${STORD_STATE_DIR}" "${STORD_LOG_DIR}" >/dev/null 2>&1; then
+    record_add "dir" "${STORD_HOME}" "数据根目录"
+    record_add "dir" "${STORD_SERVICES_DIR}" "服务目录"
+    record_add "dir" "${STORD_BACKUPS_DIR}" "备份目录"
+    record_add "dir" "${STORD_STATE_DIR}" "状态目录"
+    record_add "dir" "${STORD_LOG_DIR}" "日志目录"
     return 0
   fi
-
-  if ! is_root; then
-    warn "No permission to create storage dirs under: ${STORD_HOME}"
-    say "To keep the default path, run with sudo:"
-    say "  sudo -E ${PROG_NAME}"
-    say
-    say "Or override the data dir for your user:"
-    say "  STORD_HOME=\"${HOME}/.${PROG_NAME}\" ${PROG_NAME}"
-    say
-    if confirm "Switch to user data dir now (${HOME}/.${PROG_NAME}) and continue?"; then
-      STORD_HOME="${HOME}/.${PROG_NAME}"
-      STORD_SERVICES_DIR="${STORD_HOME}/services"
-      STORD_BACKUPS_DIR="${STORD_HOME}/backups"
-      STORD_STATE_DIR="${STORD_HOME}/state"
-      STORD_LOG_DIR="${STORD_HOME}/logs"
-      mkdir -p "${STORD_SERVICES_DIR}" "${STORD_BACKUPS_DIR}" "${STORD_STATE_DIR}" "${STORD_LOG_DIR}"
-      return 0
-    fi
-  fi
-  die "failed to create storage dirs under: ${STORD_HOME}"
+  die "无法创建目录：${STORD_HOME}"
 }
 
 mem_total_mb() {
@@ -278,10 +299,10 @@ compose() {
   local service="$1"; shift
   local svc_dir="${STORD_SERVICES_DIR}/${service}"
   local f="${svc_dir}/docker-compose.yml"
-  [[ -f "${f}" ]] || die "service not deployed: ${service} (missing ${f})"
+  [[ -f "${f}" ]] || die "服务未部署：${service}（缺少 ${f}）"
 
   local cb
-  cb="$(compose_bin)" || die "docker compose not found (install docker + compose plugin)"
+  cb="$(compose_bin)" || die "未找到 docker compose（请安装 Docker + compose 插件）"
 
   # Ensure `.env` and relative paths resolve against the service directory.
   # shellcheck disable=SC2086
@@ -312,10 +333,10 @@ show_env() {
   local service="$1"
   local svc_dir="${STORD_SERVICES_DIR}/${service}"
   local envf="${svc_dir}/.env"
-  [[ -f "${envf}" ]] || die "missing env: ${envf}"
+  [[ -f "${envf}" ]] || die "缺少 env 文件：${envf}"
 
-  say "Service: ${service}"
-  say "Config:  ${svc_dir}"
+  say "服务：${service}"
+  say "配置：${svc_dir}"
   say
   while IFS='=' read -r k v; do
     case "${k}" in
@@ -340,7 +361,7 @@ show_env_all() {
     show_env "${svc}"
   done < <(list_services)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
@@ -348,20 +369,20 @@ ensure_docker() {
   if have docker; then
     return 0
   fi
-  say "Docker is not installed."
-  say "Recommended: install Docker Engine + compose plugin."
+  say "未检测到 Docker。"
+  say "建议安装：Docker Engine + compose 插件。"
   say
-  if confirm "Install Docker via official convenience script (get.docker.com)?"; then
+  if confirm "使用官方脚本（get.docker.com）安装 Docker？"; then
     require curl
     curl -fsSL https://get.docker.com | sh
-    say "Docker installed. You may need to relogin or run: sudo usermod -aG docker $USER"
+    say "Docker 已安装。你可能需要重新登录或执行：sudo usermod -aG docker $USER"
   else
-    die "docker is required"
+    die "必须先安装 Docker"
   fi
 }
 
 ensure_compose() {
-  compose_bin >/dev/null 2>&1 || die "docker compose not available (install docker compose plugin or docker-compose)"
+  compose_bin >/dev/null 2>&1 || die "未找到 docker compose（请安装 compose 插件或 docker-compose）"
 }
 
 pkg_manager() {
@@ -373,9 +394,9 @@ pkg_manager() {
 }
 
 pkg_install() {
-  local pm; pm="$(pkg_manager)" || die "no supported package manager found (apt/yum/dnf/apk)"
+  local pm; pm="$(pkg_manager)" || die "未找到支持的包管理器（apt/yum/dnf/apk）"
   if ! is_root; then
-    die "package installation requires root"
+    die "安装系统依赖需要 root 权限"
   fi
   case "${pm}" in
     apt)
@@ -392,18 +413,18 @@ ensure_crontab() {
   if have crontab; then
     return 0
   fi
-  warn "crontab not found; backup scheduling needs cron."
-  if ! confirm "Install cron now?"; then
-    die "crontab not found (install cron)"
+  warn "未找到 crontab；定时备份需要 cron。"
+  if ! confirm "现在安装 cron？"; then
+    die "未找到 crontab（请先安装 cron）"
   fi
-  local pm; pm="$(pkg_manager)" || die "no supported package manager found (apt/yum/dnf/apk)"
+  local pm; pm="$(pkg_manager)" || die "未找到支持的包管理器（apt/yum/dnf/apk）"
   case "${pm}" in
     apt) pkg_install cron ;;
     dnf|yum) pkg_install cronie ;;
     apk) pkg_install cronie ;;
   esac
-  have crontab || die "installed cron but crontab still not found"
-  warn "cron installed. Ensure the cron service is enabled/running on your system."
+  have crontab || die "已安装 cron 但仍找不到 crontab"
+  warn "cron 已安装，请确保系统里 cron 服务已启用并运行。"
 }
 
 write_file() {
@@ -434,16 +455,16 @@ svc_default_port() {
 }
 
 svc_host_port() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local port
   port="$(env_get "${svc}" STORE_PORT || true)"
   port="${port:-$(svc_default_port "${svc}")}"
-  [[ -n "${port}" ]] || die "unknown service: ${svc}"
+  [[ -n "${port}" ]] || die "未知服务：${svc}"
   echo "${port}"
 }
 
 dsn_host_hint() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local host
   host="$(env_get "${svc}" STORE_BIND || true)"
   host="${host:-127.0.0.1}"
@@ -455,14 +476,14 @@ dsn_host_hint() {
 }
 
 container_name() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   echo "${PROG_NAME}-${svc}"
 }
 
 warn_if_public_bind() {
   local bind="$1" port="$2" svc="$3"
   if [[ "${bind}" == "0.0.0.0" ]]; then
-    warn "${svc} is bound to 0.0.0.0:${port} (public). Ensure firewall whitelists your app server IP."
+    warn "${svc} 绑定到 0.0.0.0:${port}（公网可达）。请用防火墙仅放行你的应用服务器 IP。"
   fi
 }
 
@@ -473,7 +494,7 @@ is_valid_port() {
 }
 
 port_in_use_proc() {
-  local port="${1:?port required}"
+  local port="${1:?需要端口}"
   is_valid_port "${port}" || return 1
   local ph
   ph="$(printf "%04X" "${port}")"
@@ -502,7 +523,7 @@ port_in_use_proc() {
 }
 
 port_in_use() {
-  local port="${1:?port required}"
+  local port="${1:?需要端口}"
   if [[ -r /proc/net/tcp ]]; then
     port_in_use_proc "${port}"
     return $?
@@ -538,35 +559,44 @@ random_free_port() {
       return 0
     fi
   done
-  die "unable to find a free TCP port in range ${min}-${max}"
+  die "无法在 ${min}-${max} 范围内找到可用端口"
 }
 
 select_port() {
-  local svc="${1:?service required}"
-  local label="${2:?label required}"
-  local def="${3:?default port required}"
+  local svc="${1:?需要服务名}"
+  local label="${2:?需要名称}"
+  local def="${3:?需要默认端口}"
 
   if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
     if port_in_use "${def}"; then
-      die "${label} default port ${def} is already in use; rerun interactively or pick another port"
+      die "${label} 默认端口 ${def} 已被占用；请用交互模式重新选择端口"
     fi
     echo "${def}"
     return 0
   fi
 
   local port
-  if confirm "Use random port for ${label}? (default: ${def})"; then
+  if confirm "使用默认端口 ${def}？"; then
+    if port_in_use "${def}"; then
+      warn "端口 ${def} 已被占用，需选择其他端口。"
+    else
+      echo "${def}"
+      return 0
+    fi
+  fi
+
+  if confirm "使用随机可用端口？"; then
     port="$(random_free_port)"
-    say "Selected random port: ${port}"
+    say "已选择随机端口：${port}"
     echo "${port}"
     return 0
   fi
 
-  port="$(prompt "${label} port" "${def}")"
+  port="$(prompt "${label} 端口" "")"
   while true; do
     if ! is_valid_port "${port}"; then
-      warn "Invalid port: ${port} (must be 1-65535)"
-      port="$(prompt "${label} port" "${def}")"
+      warn "端口无效：${port}（必须是 1-65535）"
+      port="$(prompt "${label} 端口" "${def}")"
       continue
     fi
     if ! port_in_use "${port}"; then
@@ -574,27 +604,27 @@ select_port() {
       return 0
     fi
 
-    warn "Port ${port} is already in use."
-    say "1) Use a random free port"
-    say "2) Enter another port"
-    say "3) Abort"
+    warn "端口 ${port} 已被占用。"
+    say "1) 使用随机可用端口"
+    say "2) 输入其他端口"
+    say "3) 取消"
     local choice
-    choice="$(prompt "Select" "1")"
+    choice="$(prompt "选择" "1")"
     case "${choice}" in
       1)
         port="$(random_free_port)"
-        say "Selected random port: ${port}"
+        say "已选择随机端口：${port}"
         echo "${port}"
         return 0
         ;;
       2)
-        port="$(prompt "${label} port" "")"
+        port="$(prompt "${label} 端口" "")"
         ;;
       3)
-        die "aborted"
+        die "已取消"
         ;;
       *)
-        say "Unknown selection."
+        say "未知选项。"
         ;;
     esac
   done
@@ -608,21 +638,22 @@ deploy_mariadb() {
   local svc="mariadb"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf.d"
+  record_add "service" "${svc_dir}" "服务 mariadb"
 
   local bind default_bind port rootpw db user pass buf_mb
   default_bind="0.0.0.0"
-  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "${default_bind}")"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${default_bind}")"
   port="$(select_port "${svc}" "MariaDB" "3306")"
-  db="$(prompt "Database name" "appdb")"
-  user="$(prompt "App username" "app")"
+  db="$(prompt "数据库名" "appdb")"
+  user="$(prompt "应用用户名" "app")"
 
-  rootpw="$(prompt_secret "Root password" "<random>")"
+  rootpw="$(prompt_secret "Root 密码" "<random>")"
   if [[ -z "${rootpw}" ]]; then rootpw="$(random_hex 16)"; fi
-  pass="$(prompt_secret "App user password" "<random>")"
+  pass="$(prompt_secret "应用用户密码" "<random>")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
 
-  buf_mb="$(prompt "InnoDB buffer pool (MB)" "$(suggest_mariadb_buffer_pool_mb)")"
-  if [[ ! "${buf_mb}" =~ ^[0-9]+$ ]]; then die "buffer pool must be an integer (MB)"; fi
+  buf_mb="$(prompt "InnoDB 缓冲池（MB）" "$(suggest_mariadb_buffer_pool_mb)")"
+  if [[ ! "${buf_mb}" =~ ^[0-9]+$ ]]; then die "缓冲池必须是整数（MB）"; fi
 
   write_file "${svc_dir}/.env" \
     "MARIADB_ROOT_PASSWORD=${rootpw}
@@ -677,26 +708,26 @@ collation-server=utf8mb4_unicode_ci
 "
 
   say
-  say "About to deploy MariaDB:"
-  say "- dir:  ${svc_dir}"
-  say "- bind: ${bind}:${port}"
+  say "即将部署 MariaDB："
+  say "- 目录：${svc_dir}"
+  say "- 绑定：${bind}:${port}"
   say
   warn_if_public_bind "${bind}" "${port}" "mariadb"
-  if ! confirm "Run docker compose up -d now?"; then
-    say "Saved config only. Start later with: ${PROG_NAME} start mariadb"
+  if ! confirm "现在执行 docker compose up -d？"; then
+    say "已保存配置。稍后可用：${PROG_NAME} start mariadb"
     return 0
   fi
 
   compose "${svc}" up -d
-  say "MariaDB started."
+  say "MariaDB 已启动。"
   say
-  say "Connection:"
-  say "- host: ${bind}"
-  say "- port: ${port}"
-  say "- db:   ${db}"
-  say "- user: ${user}"
-  say "- pass: ${pass}"
-  say "- root: ${rootpw}"
+  say "连接信息："
+  say "- host：${bind}"
+  say "- port：${port}"
+  say "- db：  ${db}"
+  say "- user：${user}"
+  say "- pass：${pass}"
+  say "- root：${rootpw}"
 }
 
 deploy_mongodb() {
@@ -707,17 +738,18 @@ deploy_mongodb() {
   local svc="mongodb"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
+  record_add "service" "${svc_dir}" "服务 mongodb"
 
   local bind port rootuser rootpass cache_mb cache_gb
-  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "0.0.0.0")"
   port="$(select_port "${svc}" "MongoDB" "27017")"
-  rootuser="$(prompt "Mongo root username" "root")"
-  rootpass="$(prompt_secret "Mongo root password" "<random>")"
+  rootuser="$(prompt "Mongo root 用户名" "root")"
+  rootpass="$(prompt_secret "Mongo root 密码" "<random>")"
   if [[ -z "${rootpass}" ]]; then rootpass="$(random_hex 16)"; fi
 
-  cache_mb="$(prompt "MongoDB WiredTiger cache (MB)" "$(suggest_mongodb_cache_mb)")"
+  cache_mb="$(prompt "MongoDB WiredTiger 缓存（MB）" "$(suggest_mongodb_cache_mb)")"
   if [[ ! "${cache_mb}" =~ ^[0-9]+$ ]]; then
-    die "cache_mb must be an integer"
+    die "缓存必须是整数（MB）"
   fi
   cache_gb="$(awk "BEGIN { printf \"%.3f\", ${cache_mb}/1024 }")"
 
@@ -771,25 +803,25 @@ processManagement:
 "
 
   say
-  say "About to deploy MongoDB:"
-  say "- dir:  ${svc_dir}"
-  say "- bind: ${bind}:${port}"
-  say "- cache: ${cache_mb}MB (${cache_gb}GB)"
+  say "即将部署 MongoDB："
+  say "- 目录：${svc_dir}"
+  say "- 绑定：${bind}:${port}"
+  say "- 缓存：${cache_mb}MB (${cache_gb}GB)"
   say
   warn_if_public_bind "${bind}" "${port}" "mongodb"
-  if ! confirm "Run docker compose up -d now?"; then
-    say "Saved config only. Start later with: ${PROG_NAME} start mongodb"
+  if ! confirm "现在执行 docker compose up -d？"; then
+    say "已保存配置。稍后可用：${PROG_NAME} start mongodb"
     return 0
   fi
 
   compose "${svc}" up -d
-  say "MongoDB started."
+  say "MongoDB 已启动。"
   say
-  say "Connection:"
-  say "- host: ${bind}"
-  say "- port: ${port}"
-  say "- user: ${rootuser}"
-  say "- pass: ${rootpass}"
+  say "连接信息："
+  say "- host：${bind}"
+  say "- port：${port}"
+  say "- user：${rootuser}"
+  say "- pass：${rootpass}"
 }
 
 deploy_redis() {
@@ -800,12 +832,13 @@ deploy_redis() {
   local svc="redis"
   local svc_dir="${STORD_SERVICES_DIR}/${svc}"
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
+  record_add "service" "${svc_dir}" "服务 redis"
 
   local bind port pass maxmem
-  bind="$(prompt "Bind address (0.0.0.0 for remote, 127.0.0.1 for local-only)" "0.0.0.0")"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "0.0.0.0")"
   port="$(select_port "${svc}" "Redis" "6379")"
-  maxmem="$(prompt "Redis maxmemory (e.g. 128mb)" "$(suggest_redis_maxmem_mb)mb")"
-  pass="$(prompt_secret "Redis password" "<random>")"
+  maxmem="$(prompt "Redis maxmemory（如 128mb）" "$(suggest_redis_maxmem_mb)mb")"
+  pass="$(prompt_secret "Redis 密码" "<random>")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
 
   write_file "${svc_dir}/.env" \
@@ -851,24 +884,24 @@ save 60 10000
 "
 
   say
-  say "About to deploy Redis:"
-  say "- dir:  ${svc_dir}"
-  say "- bind: ${bind}:${port}"
-  say "- maxmemory: ${maxmem}"
+  say "即将部署 Redis："
+  say "- 目录：${svc_dir}"
+  say "- 绑定：${bind}:${port}"
+  say "- maxmemory：${maxmem}"
   say
   warn_if_public_bind "${bind}" "${port}" "redis"
-  if ! confirm "Run docker compose up -d now?"; then
-    say "Saved config only. Start later with: ${PROG_NAME} start redis"
+  if ! confirm "现在执行 docker compose up -d？"; then
+    say "已保存配置。稍后可用：${PROG_NAME} start redis"
     return 0
   fi
 
   compose "${svc}" up -d
-  say "Redis started."
+  say "Redis 已启动。"
   say
-  say "Connection:"
-  say "- host: ${bind}"
-  say "- port: ${port}"
-  say "- pass: ${pass}"
+  say "连接信息："
+  say "- host：${bind}"
+  say "- port：${port}"
+  say "- pass：${pass}"
 }
 
 deploy() {
@@ -877,7 +910,7 @@ deploy() {
     mariadb) deploy_mariadb ;;
     mongodb) deploy_mongodb ;;
     redis) deploy_redis ;;
-    *) die "usage: ${PROG_NAME} deploy {mariadb|mongodb|redis}" ;;
+    *) die "用法：${PROG_NAME} deploy {mariadb|mongodb|redis}" ;;
   esac
 }
 
@@ -895,15 +928,15 @@ for_each_deployed() {
     if [[ -f "${svc_dir}/docker-compose.yml" ]]; then
       printf "%s\n" "${svc}"
     else
-      warn "Skipping ${svc}: missing docker-compose.yml"
+      warn "跳过 ${svc}：缺少 docker-compose.yml"
     fi
   done < <(list_services)
 }
 
 status_all() {
   if ! compose_bin >/dev/null 2>&1; then
-    say "compose is not available; cannot show container status."
-    say "Deployed service dirs:"
+    say "compose 不可用，无法显示容器状态。"
+    say "已部署服务目录："
     list_services | sed 's/^/ - /'
     return 0
   fi
@@ -915,7 +948,7 @@ status_all() {
     compose "${svc}" ps || true
   done < <(for_each_deployed)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
@@ -923,11 +956,11 @@ start_all() {
   local any=0 svc
   while IFS= read -r svc; do
     any=1
-    say "Starting: ${svc}"
+    say "启动：${svc}"
     compose "${svc}" up -d
   done < <(for_each_deployed)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
@@ -935,11 +968,11 @@ stop_all() {
   local any=0 svc
   while IFS= read -r svc; do
     any=1
-    say "Stopping: ${svc}"
+    say "停止：${svc}"
     compose "${svc}" down
   done < <(for_each_deployed)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
@@ -947,11 +980,11 @@ restart_all() {
   local any=0 svc
   while IFS= read -r svc; do
     any=1
-    say "Restarting: ${svc}"
+    say "重启：${svc}"
     compose "${svc}" restart
   done < <(for_each_deployed)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
@@ -960,56 +993,56 @@ logs_all() {
   while IFS= read -r svc; do
     any=1
     say
-    say "== ${svc} (tail 200) =="
+    say "== ${svc}（最近 200 行）=="
     compose "${svc}" logs --tail=200 || true
   done < <(for_each_deployed)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
 remove_service() {
-  local svc="${1:?service required}"
-  say "Remove service (stop containers): ${svc}"
-  if ! confirm "docker compose down for ${svc}?"; then
-    say "Canceled."
+  local svc="${1:?需要服务名}"
+  say "移除服务（仅停止容器）：${svc}"
+  if ! confirm "对 ${svc} 执行 docker compose down？"; then
+    say "已取消。"
     return 0
   fi
   compose "${svc}" down
-  say "Stopped: ${svc}"
+  say "已停止：${svc}"
 }
 
 purge_service() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local svc_dir; svc_dir="$(service_dir "${svc}")"
-  [[ -d "${svc_dir}" ]] || die "service not deployed: ${svc}"
-  say "Purge service (STOP + DELETE DATA): ${svc}"
-  say "- dir: ${svc_dir}"
+  [[ -d "${svc_dir}" ]] || die "服务未部署：${svc}"
+  say "彻底清理服务（停止 + 删除数据）：${svc}"
+  say "- 目录：${svc_dir}"
   say
-  warn "This will delete ${svc_dir} (including ./data)."
-  if ! confirm "Proceed with purge?"; then
-    say "Canceled."
+  warn "将删除 ${svc_dir}（包含 ./data）。"
+  if ! confirm "继续清理？"; then
+    say "已取消。"
     return 0
   fi
   if [[ "${STORD_ASSUME_YES}" != "1" && "${STORD_NON_INTERACTIVE}" != "1" ]]; then
     local typed
-    typed="$(prompt "Confirm by typing YES" "")"
-    [[ "${typed}" == "YES" ]] || die "purge not confirmed"
+    typed="$(prompt "输入 YES 进行确认" "")"
+    [[ "${typed}" == "YES" ]] || die "未确认清理"
   fi
   compose "${svc}" down || true
   rm -rf "${svc_dir}"
-  say "Purged: ${svc}"
+  say "已清理：${svc}"
 }
 
 config_path() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   echo "$(service_dir "${svc}")"
 }
 
 config_edit() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local envf; envf="$(service_dir "${svc}")/.env"
-  [[ -f "${envf}" ]] || die "missing env: ${envf}"
+  [[ -f "${envf}" ]] || die "缺少 env 文件：${envf}"
   local editor="${EDITOR:-}"
   if [[ -z "${editor}" ]]; then
     if have nano; then editor="nano"; elif have vim; then editor="vim"; else editor="vi"; fi
@@ -1018,7 +1051,7 @@ config_edit() {
 }
 
 dsn_service() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local host port
   host="$(dsn_host_hint "${svc}")"
   port="$(svc_host_port "${svc}")"
@@ -1041,7 +1074,7 @@ dsn_service() {
       say "redis://:<password>@${host}:${port}/0"
       ;;
     *)
-      die "unknown service: ${svc}"
+      die "未知服务：${svc}"
       ;;
   esac
 }
@@ -1056,17 +1089,17 @@ dsn_all() {
     say "${svc}: $(dsn_service "${svc}")"
   done < <(list_services)
   if [[ "${any}" == "0" ]]; then
-    say "No deployed services."
+    say "暂无已部署服务。"
   fi
 }
 
 secrets_service() {
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local envf; envf="$(service_dir "${svc}")/.env"
-  [[ -f "${envf}" ]] || die "missing env: ${envf}"
-  warn "This will print secrets to your terminal history."
-  if ! confirm "Show raw secrets for ${svc}?"; then
-    say "Canceled."
+  [[ -f "${envf}" ]] || die "缺少 env 文件：${envf}"
+  warn "此操作会把敏感信息打印到终端历史记录。"
+  if ! confirm "显示 ${svc} 的原始密钥？"; then
+    say "已取消。"
     return 0
   fi
   cat "${envf}"
@@ -1074,19 +1107,19 @@ secrets_service() {
 
 export_config() {
   require tar
-  local svc="${1:?service required}"
+  local svc="${1:?需要服务名}"
   local svc_dir; svc_dir="$(service_dir "${svc}")"
-  [[ -d "${svc_dir}" ]] || die "service not deployed: ${svc}"
+  [[ -d "${svc_dir}" ]] || die "服务未部署：${svc}"
   local ts out
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   out="${2:-${STORD_BACKUPS_DIR}/${PROG_NAME}-${svc}-config-${ts}.tgz}"
   mkdir -p "$(dirname "${out}")"
 
-  say "Export config (excluding data) for ${svc}"
-  say "- from: ${svc_dir}"
-  say "- to:   ${out}"
-  if ! confirm "Proceed?"; then
-    say "Canceled."
+  say "导出配置（不含数据）：${svc}"
+  say "- 来源：${svc_dir}"
+  say "- 目标：${out}"
+  if ! confirm "继续导出？"; then
+    say "已取消。"
     return 0
   fi
 
@@ -1095,32 +1128,32 @@ export_config() {
   [[ -f "${svc_dir}/.env" ]] && items+=(".env")
   [[ -d "${svc_dir}/conf" ]] && items+=("conf")
   [[ -d "${svc_dir}/conf.d" ]] && items+=("conf.d")
-  [[ ${#items[@]} -gt 0 ]] || die "nothing to export"
+  [[ ${#items[@]} -gt 0 ]] || die "没有可导出的内容"
 
   (cd "${svc_dir}" && tar -czf "${out}" "${items[@]}")
-  say "Exported: ${out}"
+  say "导出完成：${out}"
 }
 
 import_config() {
   require tar
-  local svc="${1:?service required}"
-  local file="${2:?config file required (.tgz)}"
-  [[ -f "${file}" ]] || die "file not found: ${file}"
+  local svc="${1:?需要服务名}"
+  local file="${2:?需要配置文件（.tgz）}"
+  [[ -f "${file}" ]] || die "文件不存在：${file}"
 
   local svc_dir; svc_dir="$(service_dir "${svc}")"
   mkdir -p "${svc_dir}"
 
-  warn "Importing config will overwrite files like .env / docker-compose.yml, but will NOT touch ./data."
-  say "- service: ${svc}"
-  say "- into:    ${svc_dir}"
-  say "- from:    ${file}"
-  if ! confirm "Proceed with import?"; then
-    say "Canceled."
+  warn "导入会覆盖 .env / docker-compose.yml 等文件，但不会动 ./data。"
+  say "- 服务：${svc}"
+  say "- 目录：${svc_dir}"
+  say "- 文件：${file}"
+  if ! confirm "继续导入？"; then
+    say "已取消。"
     return 0
   fi
 
   (cd "${svc_dir}" && tar -xzf "${file}")
-  say "Imported config."
+  say "导入完成。"
 }
 
 list_services() {
@@ -1132,36 +1165,36 @@ list_services() {
 
 doctor() {
   say "${PROG_NAME} doctor"
-  say "- version: ${STORD_VERSION}"
-  say "- home:    ${STORD_HOME}"
-  say "- raw url: ${STORD_RAW_URL}"
-  say "- mem:     $(mem_total_mb)MB"
-  say "- suggest: mariadb buffer=$(suggest_mariadb_buffer_pool_mb)MB, mongodb cache=$(suggest_mongodb_cache_mb)MB, redis maxmem=$(suggest_redis_maxmem_mb)MB"
+  say "- 版本：${STORD_VERSION}"
+  say "- 根目录：${STORD_HOME}"
+  say "- Raw URL：${STORD_RAW_URL}"
+  say "- 内存：$(mem_total_mb)MB"
+  say "- 建议：mariadb buffer=$(suggest_mariadb_buffer_pool_mb)MB，mongodb cache=$(suggest_mongodb_cache_mb)MB，redis maxmem=$(suggest_redis_maxmem_mb)MB"
   say
   if have docker; then
-    say "docker:    ok ($(docker --version 2>/dev/null || true))"
+    say "docker：    ok ($(docker --version 2>/dev/null || true))"
   else
-    say "docker:    missing"
+    say "docker：    缺失"
   fi
   if compose_bin >/dev/null 2>&1; then
-    say "compose:   ok ($(compose_bin))"
+    say "compose：   ok ($(compose_bin))"
   else
-    say "compose:   missing"
+    say "compose：   缺失"
   fi
   if have curl; then
-    say "curl:      ok"
+    say "curl：      ok"
   else
-    say "curl:      missing"
+    say "curl：      缺失"
   fi
   if have ufw; then
-    say "ufw:       ok"
+    say "ufw：       ok"
   elif have firewall-cmd; then
-    say "firewalld: ok"
+    say "firewalld： ok"
   else
-    say "firewall:  none detected"
+    say "防火墙：    未检测到"
   fi
   say
-  say "Deployed services:"
+  say "已部署服务："
   list_services | sed 's/^/ - /'
 }
 
@@ -1177,50 +1210,50 @@ firewall_allow() {
     firewall-cmd --reload
     return 0
   fi
-  die "no supported firewall tool found (ufw or firewalld)"
+  die "未找到可用的防火墙工具（ufw 或 firewalld）"
 }
 
 configure_firewall_menu() {
   say
-  say "Firewall helper (whitelist IP -> port)."
-  say "This will ADD allow rules; it won't remove existing rules."
+  say "防火墙助手（白名单 IP -> 端口）。"
+  say "只会新增放行规则，不会删除已有规则。"
   say
   local svc ip port
-  svc="$(prompt "Service to allow (mariadb/mongodb/redis/custom)" "")"
+  svc="$(prompt "选择服务（mariadb/mongodb/redis/custom）" "")"
   if [[ "${svc}" == "custom" ]]; then
-    port="$(prompt "Port to allow" "")"
-    [[ "${port}" =~ ^[0-9]+$ ]] || die "invalid port: ${port}"
+    port="$(prompt "放行端口" "")"
+    [[ "${port}" =~ ^[0-9]+$ ]] || die "端口无效：${port}"
   else
     port="$(svc_host_port "${svc}")"
   fi
-  ip="$(prompt "Allowed client IPv4 (e.g. 1.2.3.4/32)" "")"
-  [[ -n "${ip}" ]] || die "ip is required"
-  if ! confirm "Allow ${ip} -> ${svc} port ${port}?"; then
-    say "Canceled."
+  ip="$(prompt "允许的客户端 IPv4（如 1.2.3.4/32）" "")"
+  [[ -n "${ip}" ]] || die "IP 不能为空"
+  if ! confirm "放行 ${ip} -> ${svc} 端口 ${port}？"; then
+    say "已取消。"
     return 0
   fi
   if ! is_root; then
-    die "firewall changes require root"
+    die "修改防火墙需要 root 权限"
   fi
   firewall_allow "${port}" "${ip}"
-  say "Rule added."
+  say "规则已添加。"
 }
 
 backup_list_files() {
   ensure_dirs
   local svc="${1:-all}"
   local dir="${STORD_BACKUPS_DIR}"
-  [[ -d "${dir}" ]] || { say "No backups directory: ${dir}"; return 0; }
+  [[ -d "${dir}" ]] || { say "未找到备份目录：${dir}"; return 0; }
 
   local pat=()
   case "${svc}" in
     all) pat+=("mariadb-*.sql" "mariadb-*.sql.gz" "mongodb-*.archive" "mongodb-*.archive.gz") ;;
     mariadb) pat+=("mariadb-*.sql" "mariadb-*.sql.gz") ;;
     mongodb) pat+=("mongodb-*.archive" "mongodb-*.archive.gz") ;;
-    *) die "usage: ${PROG_NAME} backup files [mariadb|mongodb|all]" ;;
+    *) die "用法：${PROG_NAME} backup files [mariadb|mongodb|all]" ;;
   esac
 
-  say "Backup files in ${dir}:"
+  say "备份文件（${dir}）："
   local out
   out="$(
     for p in "${pat[@]}"; do
@@ -1230,7 +1263,7 @@ backup_list_files() {
   if [[ -n "${out}" ]]; then
     printf "%s\n" "${out}"
   else
-    say "(none)"
+    say "（无）"
   fi
 }
 
@@ -1239,27 +1272,27 @@ backup_prune() {
   local svc="${1:-all}"
   local days="${2:-}"
   if [[ -z "${days}" ]]; then
-    days="$(prompt "Delete backups older than N days" "14")"
+    days="$(prompt "删除多少天前的备份" "14")"
   fi
-  [[ "${days}" =~ ^[0-9]+$ ]] || die "days must be an integer"
+  [[ "${days}" =~ ^[0-9]+$ ]] || die "天数必须是整数"
 
   local dir="${STORD_BACKUPS_DIR}"
-  [[ -d "${dir}" ]] || { say "No backups directory: ${dir}"; return 0; }
+  [[ -d "${dir}" ]] || { say "未找到备份目录：${dir}"; return 0; }
 
   local patterns=()
   case "${svc}" in
     all) patterns+=("mariadb-*.sql" "mariadb-*.sql.gz" "mongodb-*.archive" "mongodb-*.archive.gz") ;;
     mariadb) patterns+=("mariadb-*.sql" "mariadb-*.sql.gz") ;;
     mongodb) patterns+=("mongodb-*.archive" "mongodb-*.archive.gz") ;;
-    *) die "usage: ${PROG_NAME} backup prune [mariadb|mongodb|all] [days]" ;;
+    *) die "用法：${PROG_NAME} backup prune [mariadb|mongodb|all] [days]" ;;
   esac
 
-  say "Prune backups older than ${days} days:"
-  say "- dir: ${dir}"
-  say "- svc: ${svc}"
-  warn "This will DELETE files."
-  if ! confirm "Proceed?"; then
-    say "Canceled."
+  say "清理 ${days} 天前的备份："
+  say "- 目录：${dir}"
+  say "- 服务：${svc}"
+  warn "该操作将删除文件。"
+  if ! confirm "继续清理？"; then
+    say "已取消。"
     return 0
   fi
 
@@ -1267,29 +1300,29 @@ backup_prune() {
   for pat in "${patterns[@]}"; do
     find "${dir}" -maxdepth 1 -type f -name "${pat}" -mtime +"${days}" -print -delete 2>/dev/null || true
   done
-  say "Prune complete."
+  say "清理完成。"
 }
 
 backup_mariadb() {
   local svc_dir="${STORD_SERVICES_DIR}/mariadb"
-  [[ -f "${svc_dir}/.env" ]] || die "mariadb not deployed"
+  [[ -f "${svc_dir}/.env" ]] || die "mariadb 未部署"
   local db rootpw
   db="$(grep -E '^MARIADB_DATABASE=' "${svc_dir}/.env" | cut -d= -f2-)"
   rootpw="$(grep -E '^MARIADB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
-  [[ -n "${db}" ]] || die "missing MARIADB_DATABASE"
-  [[ -n "${rootpw}" ]] || die "missing MARIADB_ROOT_PASSWORD"
+  [[ -n "${db}" ]] || die "缺少 MARIADB_DATABASE"
+  [[ -n "${rootpw}" ]] || die "缺少 MARIADB_ROOT_PASSWORD"
 
   local ts out
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   if have gzip; then
     out="${STORD_BACKUPS_DIR}/mariadb-${ts}.sql.gz"
   else
-    warn "gzip not found; writing uncompressed .sql"
+    warn "未找到 gzip，将输出未压缩的 .sql"
     out="${STORD_BACKUPS_DIR}/mariadb-${ts}.sql"
   fi
   mkdir -p "${STORD_BACKUPS_DIR}"
 
-  say "Backing up mariadb -> ${out}"
+  say "备份 MariaDB -> ${out}"
   if [[ "${out}" == *.gz ]]; then
     docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
       | gzip -9 > "${out}"
@@ -1297,29 +1330,29 @@ backup_mariadb() {
     docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
       > "${out}"
   fi
-  say "Backup ok."
+  say "备份完成。"
 }
 
 backup_mongodb() {
   local svc_dir="${STORD_SERVICES_DIR}/mongodb"
-  [[ -f "${svc_dir}/.env" ]] || die "mongodb not deployed"
+  [[ -f "${svc_dir}/.env" ]] || die "mongodb 未部署"
   local user pass
   user="$(grep -E '^MONGO_INITDB_ROOT_USERNAME=' "${svc_dir}/.env" | cut -d= -f2-)"
   pass="$(grep -E '^MONGO_INITDB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
-  [[ -n "${user}" ]] || die "missing MONGO_INITDB_ROOT_USERNAME"
-  [[ -n "${pass}" ]] || die "missing MONGO_INITDB_ROOT_PASSWORD"
+  [[ -n "${user}" ]] || die "缺少 MONGO_INITDB_ROOT_USERNAME"
+  [[ -n "${pass}" ]] || die "缺少 MONGO_INITDB_ROOT_PASSWORD"
 
   local ts out
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   if have gzip; then
     out="${STORD_BACKUPS_DIR}/mongodb-${ts}.archive.gz"
   else
-    warn "gzip not found; writing uncompressed .archive"
+    warn "未找到 gzip，将输出未压缩的 .archive"
     out="${STORD_BACKUPS_DIR}/mongodb-${ts}.archive"
   fi
   mkdir -p "${STORD_BACKUPS_DIR}"
 
-  say "Backing up mongodb -> ${out}"
+  say "备份 MongoDB -> ${out}"
   if [[ "${out}" == *.gz ]]; then
     docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
       | gzip -9 > "${out}"
@@ -1327,7 +1360,7 @@ backup_mongodb() {
     docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
       > "${out}"
   fi
-  say "Backup ok."
+  say "备份完成。"
 }
 
 backup() {
@@ -1335,11 +1368,11 @@ backup() {
   case "${sub}" in
     mariadb) backup_mariadb ;;
     mongodb) backup_mongodb ;;
-    redis) die "redis backup: use volume snapshot (AOF/RDB in ./data)" ;;
+    redis) die "redis 备份：请使用卷快照（AOF/RDB 在 ./data）" ;;
     files) shift; backup_list_files "${1:-all}" ;;
     prune) shift; backup_prune "${1:-all}" "${2:-}" ;;
     enable|disable|list) backup_schedule "$@" ;;
-    *) die "usage: ${PROG_NAME} backup {mariadb|mongodb} | backup {files|prune} [svc] | backup {enable|disable|list} ..." ;;
+    *) die "用法：${PROG_NAME} backup {mariadb|mongodb} | backup {files|prune} [svc] | backup {enable|disable|list} ..." ;;
   esac
 }
 
@@ -1355,7 +1388,7 @@ prog_bin() {
     echo "${self}"
     return 0
   fi
-  die "${PROG_NAME} is not in PATH; install it first (run menu -> Install / update)"
+  die "${PROG_NAME} 不在 PATH 中，请先安装（菜单 -> 安装/更新）"
 }
 
 cron_get() {
@@ -1391,106 +1424,106 @@ backup_schedule() {
       cron_get | grep "${marker_prefix}" || true
       ;;
     enable)
-      local svc="${1:?service required (mariadb|mongodb)}"
+      local svc="${1:?需要服务名（mariadb|mongodb）}"
       shift || true
-      case "${svc}" in mariadb|mongodb) ;; *) die "unsupported service for schedule: ${svc}" ;; esac
+      case "${svc}" in mariadb|mongodb) ;; *) die "不支持的服务：${svc}" ;; esac
 
       local hh mm
-      hh="$(prompt "Hour (0-23)" "3")"
-      mm="$(prompt "Minute (0-59)" "30")"
-      [[ "${hh}" =~ ^[0-9]+$ ]] && [[ "${mm}" =~ ^[0-9]+$ ]] || die "hour/minute must be integers"
+      hh="$(prompt "小时（0-23）" "3")"
+      mm="$(prompt "分钟（0-59）" "30")"
+      [[ "${hh}" =~ ^[0-9]+$ ]] && [[ "${mm}" =~ ^[0-9]+$ ]] || die "小时/分钟必须是整数"
 
       local bin; bin="$(prog_bin)"
       local marker="${marker_prefix}${svc}"
       local logf="${STORD_LOG_DIR}/backup-${svc}.log"
       local line="${mm} ${hh} * * * sh -c 'mkdir -p \"${STORD_LOG_DIR}\"; STORD_HOME=\"${STORD_HOME}\" \"${bin}\" backup ${svc} >> \"${logf}\" 2>&1' ${marker}"
-      say "Add cron:"
+      say "将添加 cron："
       say "  ${line}"
-      if ! confirm "Apply this cron entry?"; then
-        say "Canceled."
+      if ! confirm "应用该 cron 任务？"; then
+        say "已取消。"
         return 0
       fi
       if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
-        die "refusing to modify crontab in non-interactive mode (use --yes)"
+        die "非交互模式拒绝修改 crontab（使用 --yes）"
       fi
       { cron_remove_marker "${marker}"; echo "${line}"; } | cron_set
-      say "Backup schedule enabled for ${svc}."
+      say "已启用 ${svc} 的定时备份。"
       ;;
     disable)
-      local svc="${1:?service required (mariadb|mongodb)}"
+      local svc="${1:?需要服务名（mariadb|mongodb）}"
       local marker="${marker_prefix}${svc}"
-      if ! confirm "Remove cron entry for ${svc} backups?"; then
-        say "Canceled."
+      if ! confirm "删除 ${svc} 的 cron 定时任务？"; then
+        say "已取消。"
         return 0
       fi
       if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
-        die "refusing to modify crontab in non-interactive mode (use --yes)"
+        die "非交互模式拒绝修改 crontab（使用 --yes）"
       fi
       cron_remove_marker "${marker}" | cron_set
-      say "Backup schedule disabled for ${svc}."
+      say "已关闭 ${svc} 的定时备份。"
       ;;
     *)
-      die "usage: ${PROG_NAME} backup {enable|disable|list}"
+      die "用法：${PROG_NAME} backup {enable|disable|list}"
       ;;
   esac
 }
 
 restore_mariadb() {
-  local file="${1:?backup file required (.sql or .sql.gz)}"
-  [[ -f "${file}" ]] || die "file not found: ${file}"
+  local file="${1:?需要备份文件（.sql 或 .sql.gz）}"
+  [[ -f "${file}" ]] || die "文件不存在：${file}"
   local db rootpw
   db="$(env_get mariadb MARIADB_DATABASE || true)"
   rootpw="$(env_get mariadb MARIADB_ROOT_PASSWORD || true)"
-  [[ -n "${db}" ]] || die "missing mariadb config"
-  warn "This will overwrite data in database: ${db}"
-  if ! confirm "Restore MariaDB from ${file}?"; then
-    say "Canceled."
+  [[ -n "${db}" ]] || die "缺少 mariadb 配置"
+  warn "此操作会覆盖数据库中的数据：${db}"
+  if ! confirm "从 ${file} 恢复 MariaDB？"; then
+    say "已取消。"
     return 0
   fi
   local catcmd="cat"
   if [[ "${file}" == *.gz ]]; then
-    have gzip || die "gzip is required to restore .gz backups"
+    have gzip || die "恢复 .gz 备份需要 gzip"
     catcmd="gzip -dc"
   fi
   # shellcheck disable=SC2086
   ${catcmd} "${file}" | docker exec -i "$(container_name mariadb)" sh -c "mysql -uroot -p\"${rootpw}\" \"${db}\""
-  say "Restore complete."
+  say "恢复完成。"
 }
 
 restore_mongodb() {
-  local file="${1:?backup file required (.archive.gz or .archive)}"
-  [[ -f "${file}" ]] || die "file not found: ${file}"
+  local file="${1:?需要备份文件（.archive.gz 或 .archive）}"
+  [[ -f "${file}" ]] || die "文件不存在：${file}"
   local user pass
   user="$(env_get mongodb MONGO_INITDB_ROOT_USERNAME || true)"
   pass="$(env_get mongodb MONGO_INITDB_ROOT_PASSWORD || true)"
-  [[ -n "${user}" && -n "${pass}" ]] || die "missing mongodb config"
-  warn "This will restore MongoDB data from backup."
-  if ! confirm "Restore MongoDB from ${file}?"; then
-    say "Canceled."
+  [[ -n "${user}" && -n "${pass}" ]] || die "缺少 mongodb 配置"
+  warn "此操作会从备份恢复 MongoDB 数据。"
+  if ! confirm "从 ${file} 恢复 MongoDB？"; then
+    say "已取消。"
     return 0
   fi
-  local drop
-  drop="$(prompt "Drop existing collections first? (yes/no)" "yes")"
   local drop_flag=""
-  if [[ "${drop,,}" == "yes" || "${drop,,}" == "y" ]]; then drop_flag="--drop"; fi
+  if confirm "恢复前先删除已有集合？"; then
+    drop_flag="--drop"
+  fi
 
   local catcmd="cat"
   if [[ "${file}" == *.gz ]]; then
-    have gzip || die "gzip is required to restore .gz backups"
+    have gzip || die "恢复 .gz 备份需要 gzip"
     catcmd="gzip -dc"
   fi
   # shellcheck disable=SC2086
   ${catcmd} "${file}" | docker exec -i "$(container_name mongodb)" sh -c "mongorestore --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive ${drop_flag}"
-  say "Restore complete."
+  say "恢复完成。"
 }
 
 restore_service() {
-  local svc="${1:?service required}"
-  local file="${2:?backup file required}"
+  local svc="${1:?需要服务名}"
+  local file="${2:?需要备份文件}"
   case "${svc}" in
     mariadb) restore_mariadb "${file}" ;;
     mongodb) restore_mongodb "${file}" ;;
-    *) die "usage: ${PROG_NAME} restore {mariadb|mongodb} <file>" ;;
+    *) die "用法：${PROG_NAME} restore {mariadb|mongodb} <file>" ;;
   esac
 }
 
@@ -1499,20 +1532,20 @@ self_update() {
   require curl
   local target
   target="$(command -v "${PROG_NAME}" || true)"
-  [[ -n "${target}" ]] || die "${PROG_NAME} not found in PATH"
-  say "Updating ${PROG_NAME}:"
-  say "- from: ${url}"
-  say "- to:   ${target}"
+  [[ -n "${target}" ]] || die "${PROG_NAME} 不在 PATH 中"
+  say "更新 ${PROG_NAME}："
+  say "- 来源：${url}"
+  say "- 目标：${target}"
   say
-  if ! confirm "Proceed with update?"; then
-    say "Canceled."
+  if ! confirm "继续更新？"; then
+    say "已取消。"
     return 0
   fi
   if [[ ! -w "${target}" ]]; then
     if is_root; then
       :
     else
-      die "no permission to write ${target} (run as root or reinstall to ~/.local/bin)"
+      die "没有权限写入 ${target}"
     fi
   fi
   local tmp
@@ -1521,30 +1554,28 @@ self_update() {
   curl -fsSL "${url}" -o "${tmp}"
   chmod +x "${tmp}"
   mv -f "${tmp}" "${target}"
-  say "Updated."
+  say "已更新。"
 }
 
 install_self() {
   require curl
+  require_root
 
-  local target_dir="${1:-}"
-  if [[ -z "${target_dir}" ]]; then
-    if is_root; then
-      target_dir="/usr/local/bin"
-    else
-      target_dir="${HOME}/.local/bin"
-    fi
+  if [[ -n "${1:-}" ]]; then
+    warn "已忽略安装目录参数，固定安装到 /usr/local/bin"
   fi
+
+  local target_dir="/usr/local/bin"
 
   mkdir -p "${target_dir}"
   local target="${target_dir}/${PROG_NAME}"
 
-  say "Install / update ${PROG_NAME}"
-  say "- from: ${STORD_RAW_URL}"
-  say "- to:   ${target}"
+  say "安装/更新 ${PROG_NAME}"
+  say "- 来源：${STORD_RAW_URL}"
+  say "- 目标：${target}"
   say
-  if ! confirm "Proceed?"; then
-    say "Canceled."
+  if ! confirm "继续安装？"; then
+    say "已取消。"
     return 0
   fi
 
@@ -1560,20 +1591,205 @@ install_self() {
     curl -fsSL "${STORD_RAW_URL}" -o "${tmp}"
   fi
 
-  head -n 1 "${tmp}" | grep -q "bash" || die "downloaded script does not look like bash"
+  head -n 1 "${tmp}" | grep -q "bash" || die "下载的脚本看起来不像 bash 脚本"
   chmod +x "${tmp}"
 
   if [[ -e "${target}" && ! -w "${target}" ]]; then
-    die "no permission to write ${target} (run as root or choose a writable dir)"
+    die "没有权限写入 ${target}"
   fi
-  mv -f "${tmp}" "${target}"
+  cp -f "${tmp}" "${target}"
+  chmod +x "${target}"
+  record_add "bin" "${target}" "脚本"
 
-  say "Installed: ${target}"
-  if [[ ":$PATH:" != *":${target_dir}:"* ]]; then
-    say
-    say "PATH hint:"
-    say "  export PATH=\"${target_dir}:\$PATH\""
+  say "安装完成：${target}"
+}
+
+is_dir_empty() {
+  local d="$1"
+  [[ -d "${d}" ]] || return 0
+  [[ -z "$(ls -A "${d}" 2>/dev/null)" ]]
+}
+
+uninstall_script() {
+  local bin
+  bin="$(command -v "${PROG_NAME}" 2>/dev/null || true)"
+  if [[ -z "${bin}" ]]; then
+    bin="/usr/local/bin/${PROG_NAME}"
   fi
+
+  say "即将卸载脚本：${bin}"
+  if [[ ! -e "${bin}" ]]; then
+    warn "未找到脚本文件：${bin}"
+    return 0
+  fi
+  if ! confirm "删除该文件？"; then
+    say "已取消。"
+    return 0
+  fi
+  rm -f "${bin}"
+  record_remove_path "${bin}"
+  say "已删除：${bin}"
+}
+
+uninstall_all() {
+  local -a items=()
+  local -a service_items=()
+  local -a other_items=()
+  local -a parent_items=()
+  declare -A seen=()
+
+  local type path desc line
+  while IFS='|' read -r type path desc; do
+    [[ -n "${type}" && -n "${path}" ]] || continue
+    if [[ -z "${seen[${path}]:-}" ]]; then
+      items+=("${type}|${path}|${desc}")
+      seen["${path}"]=1
+    fi
+  done < <(record_list)
+
+  # 补充已安装脚本路径
+  local bin
+  bin="$(command -v "${PROG_NAME}" 2>/dev/null || true)"
+  if [[ -z "${bin}" ]]; then
+    bin="/usr/local/bin/${PROG_NAME}"
+  fi
+  if [[ -z "${seen[${bin}]:-}" ]]; then
+    items+=("bin|${bin}|脚本")
+    seen["${bin}"]=1
+  fi
+
+  # 补充实际存在的服务目录（兼容旧版本未记录的情况）
+  if [[ -d "${STORD_SERVICES_DIR}" ]]; then
+    local svc_dir svc
+    for svc_dir in "${STORD_SERVICES_DIR}"/*; do
+      [[ -d "${svc_dir}" ]] || continue
+      svc="$(basename "${svc_dir}")"
+      if [[ -z "${seen[${svc_dir}]:-}" ]]; then
+        items+=("service|${svc_dir}|服务 ${svc}")
+        seen["${svc_dir}"]=1
+      fi
+    done
+  fi
+
+  # 补充常见目录（存在则加入）
+  local d
+  for d in "${STORD_BACKUPS_DIR}" "${STORD_LOG_DIR}" "${STORD_STATE_DIR}"; do
+    if [[ -d "${d}" && -z "${seen[${d}]:-}" ]]; then
+      items+=("dir|${d}|目录")
+      seen["${d}"]=1
+    fi
+  done
+
+  if [[ ${#items[@]} -eq 0 ]]; then
+    say "未找到可卸载的内容。"
+    return 0
+  fi
+
+  local item
+  for item in "${items[@]}"; do
+    IFS='|' read -r type path desc <<<"${item}"
+    if [[ "${type}" == "service" ]]; then
+      service_items+=("${item}")
+    elif [[ "${path}" == "${STORD_HOME}" || "${path}" == "${STORD_SERVICES_DIR}" ]]; then
+      parent_items+=("${item}")
+    else
+      other_items+=("${item}")
+    fi
+  done
+
+  say "将卸载以下内容："
+  for item in "${service_items[@]}" "${other_items[@]}" "${parent_items[@]}"; do
+    IFS='|' read -r type path desc <<<"${item}"
+    local state="存在"
+    [[ -e "${path}" ]] || state="不存在"
+    if [[ -n "${desc}" ]]; then
+      say "- [${type}] ${path}（${desc}，${state}）"
+    else
+      say "- [${type}] ${path}（${state}）"
+    fi
+  done
+  if ! confirm "继续并逐项确认删除？"; then
+    say "已取消。"
+    return 0
+  fi
+
+  # 先处理服务目录
+  for item in "${service_items[@]}"; do
+    IFS='|' read -r type path desc <<<"${item}"
+    [[ -e "${path}" ]] || { say "已不存在：${path}"; continue; }
+    if ! confirm "删除服务目录 ${path}？"; then
+      say "已跳过：${path}"
+      continue
+    fi
+    local svc
+    svc="$(basename "${path}")"
+    if [[ -f "${path}/docker-compose.yml" ]]; then
+      if compose_bin >/dev/null 2>&1; then
+        say "停止容器：${svc}"
+        compose "${svc}" down || warn "停止容器失败：${svc}"
+      else
+        warn "compose 不可用，跳过停止容器：${svc}"
+      fi
+    fi
+    rm -rf "${path}"
+    record_remove_path "${path}"
+    say "已删除：${path}"
+  done
+
+  # 再处理其他文件/目录
+  for item in "${other_items[@]}"; do
+    IFS='|' read -r type path desc <<<"${item}"
+    [[ -e "${path}" ]] || { say "已不存在：${path}"; continue; }
+    if ! confirm "删除 ${path}？"; then
+      say "已跳过：${path}"
+      continue
+    fi
+    if [[ -d "${path}" ]]; then
+      rm -rf "${path}"
+    else
+      rm -f "${path}"
+    fi
+    record_remove_path "${path}"
+    say "已删除：${path}"
+  done
+
+  # 最后处理父级空目录（仅空目录才删除）
+  for item in "${parent_items[@]}"; do
+    IFS='|' read -r type path desc <<<"${item}"
+    [[ -d "${path}" ]] || continue
+    if is_dir_empty "${path}"; then
+      if confirm "删除空目录 ${path}？"; then
+        rm -rf "${path}"
+        record_remove_path "${path}"
+        say "已删除：${path}"
+      else
+        say "已跳过：${path}"
+      fi
+    else
+      warn "目录非空，保留：${path}"
+    fi
+  done
+
+  say "卸载完成。"
+}
+
+menu_uninstall() {
+  while true; do
+    say
+    say "卸载/清理："
+    say "1) 仅卸载脚本"
+    say "2) 卸载脚本 + 所有服务与数据"
+    say "0) 返回"
+    say
+    local u
+    u="$(menu_choice_num "选择" "1")"
+    case "${u}" in
+      1) uninstall_script ;;
+      2) uninstall_all ;;
+      0) return 0 ;;
+      *) say "未知选项。" ;;
+    esac
+  done
 }
 
 is_piped_run() {
@@ -1612,7 +1828,7 @@ bootstrap_menu() {
     elif [[ -x "${HOME}/.local/bin/${PROG_NAME}" ]]; then
       installed="${HOME}/.local/bin/${PROG_NAME}"
     else
-      die "installed ${PROG_NAME} but it's not in PATH; re-run using the printed PATH hint"
+      die "已安装 ${PROG_NAME} 但不在 PATH 中，请把 /usr/local/bin 加入 PATH 后重试"
     fi
   fi
 
@@ -1621,7 +1837,7 @@ bootstrap_menu() {
 }
 
 menu_choice_num() {
-  local label="${1:-Select}"
+  local label="${1:-选择}"
   local def="${2:-}"
   local out
   while true; do
@@ -1636,34 +1852,34 @@ menu_choice_num() {
       printf "%s" "${out}"
       return 0
     fi
-    say "Please enter a number."
+    say "请输入数字。"
   done
 }
 
 menu_service_actions() {
-  local svc="${1:?service required (mariadb|mongodb|redis|all)}"
+  local svc="${1:?需要服务名（mariadb|mongodb|redis|all）}"
   while true; do
     say
-    say "${PROG_NAME} — service: ${svc}"
-    say "1) Status"
-    say "2) Logs"
-    say "3) Restart"
-    say "4) Stop"
-    say "5) Start"
-    say "6) Config (masked)"
+    say "${PROG_NAME} — 服务：${svc}"
+    say "1) 状态"
+    say "2) 日志"
+    say "3) 重启"
+    say "4) 停止"
+    say "5) 启动"
+    say "6) 配置（脱敏）"
     say "7) DSN"
-    say "8) Secrets (DANGEROUS)"
-    say "9) Backup now"
-    say "10) Restore"
-    say "11) Export config (tgz)"
-    say "12) Import config (tgz)"
-    say "13) Remove service (stop)"
-    say "14) Purge service (DELETE data)"
-    say "0) Back"
+    say "8) 密钥（危险）"
+    say "9) 立即备份"
+    say "10) 恢复"
+    say "11) 导出配置（tgz）"
+    say "12) 导入配置（tgz）"
+    say "13) 移除服务（仅停止）"
+    say "14) 彻底清理（删除数据）"
+    say "0) 返回"
     say
 
     local act
-    act="$(menu_choice_num "Select" "1")"
+    act="$(menu_choice_num "选择" "1")"
     case "${act}" in
       1)
         if [[ "${svc}" == "all" ]]; then status_all; else status_service "${svc}"; fi
@@ -1692,7 +1908,7 @@ menu_service_actions() {
         ;;
       8)
         if [[ "${svc}" == "all" ]]; then
-          warn "Secrets are per-service; choose a specific service."
+          warn "密钥按服务查看，请选择具体服务。"
         else
           secrets_service "${svc}"
         fi
@@ -1700,55 +1916,55 @@ menu_service_actions() {
       9)
         case "${svc}" in
           mariadb|mongodb) backup "${svc}" ;;
-          all) warn "Backup now is per-service; choose mariadb/mongodb." ;;
-          redis) warn "Redis backup: use volume snapshot (AOF/RDB in ./data)." ;;
-          *) warn "Unknown service: ${svc}" ;;
+          all) warn "备份是按服务执行，请选择 mariadb/mongodb。" ;;
+          redis) warn "Redis 备份请使用卷快照（AOF/RDB 在 ./data）。" ;;
+          *) warn "未知服务：${svc}" ;;
         esac
         ;;
       10)
         case "${svc}" in
           mariadb|mongodb)
             local f
-            f="$(prompt "Backup file path" "")"
+            f="$(prompt "备份文件路径" "")"
             restore_service "${svc}" "${f}"
             ;;
-          *) warn "Restore supported only for mariadb/mongodb." ;;
+          *) warn "仅支持恢复 mariadb/mongodb。" ;;
         esac
         ;;
       11)
         if [[ "${svc}" == "all" ]]; then
-          warn "Export config is per-service; choose a specific service."
+          warn "导出配置需指定服务。"
         else
           local o
-          o="$(prompt "Output file (optional)" "")"
+          o="$(prompt "输出文件（可选）" "")"
           if [[ -n "${o}" ]]; then export_config "${svc}" "${o}"; else export_config "${svc}"; fi
         fi
         ;;
       12)
         if [[ "${svc}" == "all" ]]; then
-          warn "Import config is per-service; choose a specific service."
+          warn "导入配置需指定服务。"
         else
           local cf
-          cf="$(prompt "Config tgz path" "")"
+          cf="$(prompt "配置 tgz 路径" "")"
           import_config "${svc}" "${cf}"
         fi
         ;;
       13)
         if [[ "${svc}" == "all" ]]; then
-          warn "Remove is per-service; choose a specific service."
+          warn "移除需指定服务。"
         else
           remove_service "${svc}"
         fi
         ;;
       14)
         if [[ "${svc}" == "all" ]]; then
-          warn "Purge is per-service; choose a specific service."
+          warn "清理需指定服务。"
         else
           purge_service "${svc}"
         fi
         ;;
       0) return 0 ;;
-      *) say "Unknown selection." ;;
+      *) say "未知选项。" ;;
     esac
   done
 }
@@ -1756,27 +1972,27 @@ menu_service_actions() {
 menu_select_service() {
   while true; do
     say
-    say "Select service:"
+    say "选择服务："
     say "1) MariaDB"
     say "2) MongoDB"
     say "3) Redis"
-    say "4) All"
-    say "5) List deployed"
-    say "0) Back"
+    say "4) 全部"
+    say "5) 列出已部署"
+    say "0) 返回"
     say
     local s
-    s="$(menu_choice_num "Select" "1")"
+    s="$(menu_choice_num "选择" "1")"
     case "${s}" in
       1) echo "mariadb"; return 0 ;;
       2) echo "mongodb"; return 0 ;;
       3) echo "redis"; return 0 ;;
       4) echo "all"; return 0 ;;
       5)
-        say "Deployed:"
+        say "已部署："
         list_services | sed 's/^/ - /'
         ;;
       0) echo ""; return 0 ;;
-      *) say "Unknown selection." ;;
+      *) say "未知选项。" ;;
     esac
   done
 }
@@ -1784,20 +2000,20 @@ menu_select_service() {
 menu_deploy() {
   while true; do
     say
-    say "Deploy:"
+    say "部署："
     say "1) MariaDB"
     say "2) MongoDB"
     say "3) Redis"
-    say "0) Back"
+    say "0) 返回"
     say
     local d
-    d="$(menu_choice_num "Select" "1")"
+    d="$(menu_choice_num "选择" "1")"
     case "${d}" in
       1) deploy mariadb ;;
       2) deploy mongodb ;;
       3) deploy redis ;;
       0) return 0 ;;
-      *) say "Unknown selection." ;;
+      *) say "未知选项。" ;;
     esac
   done
 }
@@ -1805,38 +2021,38 @@ menu_deploy() {
 menu_backups() {
   while true; do
     say
-    say "Backups:"
-    say "1) List backup files"
-    say "2) Prune old backups"
-    say "3) Backup schedule (enable/disable/list)"
-    say "0) Back"
+    say "备份："
+    say "1) 列出备份文件"
+    say "2) 清理旧备份"
+    say "3) 定时备份（启用/禁用/列表）"
+    say "0) 返回"
     say
     local b
-    b="$(menu_choice_num "Select" "1")"
+    b="$(menu_choice_num "选择" "1")"
     case "${b}" in
       1)
         local s
-        s="$(prompt "Service (mariadb/mongodb/all)" "all")"
+        s="$(prompt "服务（mariadb/mongodb/all）" "all")"
         backup files "${s}"
         ;;
       2)
         local s d
-        s="$(prompt "Service (mariadb/mongodb/all)" "all")"
-        d="$(prompt "Retain last N days" "14")"
+        s="$(prompt "服务（mariadb/mongodb/all）" "all")"
+        d="$(prompt "保留最近 N 天" "14")"
         backup prune "${s}" "${d}"
         ;;
       3)
         local a s
-        a="$(prompt "Action (enable/disable/list)" "list")"
+        a="$(prompt "动作（enable/disable/list）" "list")"
         if [[ "${a}" == "list" ]]; then
           backup list
         else
-          s="$(prompt "Service (mariadb/mongodb)" "")"
+          s="$(prompt "服务（mariadb/mongodb）" "")"
           backup "${a}" "${s}"
         fi
         ;;
       0) return 0 ;;
-      *) say "Unknown selection." ;;
+      *) say "未知选项。" ;;
     esac
   done
 }
@@ -1848,19 +2064,20 @@ menu() {
   while true; do
     say
     say "${PROG_NAME} ${STORD_VERSION} — ${STORD_HOME}"
-    say "1) Manage a service (status/logs/...)"
-    say "2) Deploy services"
-    say "3) Backups"
-    say "4) Firewall whitelist helper"
-    say "5) Doctor (checks)"
-    say "6) Install / update ${PROG_NAME}"
-    say "7) Self-update ${PROG_NAME} (download raw)"
-    say "8) Check for updates"
-    say "0) Exit"
+    say "1) 管理服务（状态/日志/重启/备份等）"
+    say "2) 部署服务"
+    say "3) 备份"
+    say "4) 防火墙白名单助手"
+    say "5) Doctor（环境自检）"
+    say "6) 安装/更新 ${PROG_NAME}"
+    say "7) 自更新 ${PROG_NAME}（下载 raw）"
+    say "8) 检查更新"
+    say "9) 卸载/清理"
+    say "0) 退出"
     say
 
     local top
-    top="$(menu_choice_num "Select" "1")"
+    top="$(menu_choice_num "选择" "1")"
     case "${top}" in
       1)
         local svc
@@ -1875,46 +2092,48 @@ menu() {
       6) install_self "" ;;
       7) self_update ;;
       8) check_update || true ;;
+      9) menu_uninstall ;;
       0) exit 0 ;;
-      *) say "Unknown selection." ;;
+      *) say "未知选项。" ;;
     esac
   done
 }
 
 usage() {
   cat <<EOF
-${PROG_NAME} - single-node storage deploy helper
+${PROG_NAME} - 单机存储部署工具
 
-Usage:
-  ${PROG_NAME}                # interactive menu (auto-installs if piped)
+用法：
+  ${PROG_NAME}                # 交互菜单（如用 curl|bash 会自动安装）
   ${PROG_NAME} [--yes] [--non-interactive] <command> ...
   ${PROG_NAME} menu
   ${PROG_NAME} doctor
   ${PROG_NAME} check-update
-  ${PROG_NAME} install [dir]
+  ${PROG_NAME} install        # 安装到 /usr/local/bin
   ${PROG_NAME} deploy <svc>   # mariadb|mongodb|redis
   ${PROG_NAME} start <svc|all>
   ${PROG_NAME} stop <svc|all>
   ${PROG_NAME} restart <svc|all>
-  ${PROG_NAME} status [svc|all]       # default: all
+  ${PROG_NAME} status [svc|all]       # 默认：all
   ${PROG_NAME} logs <svc|all>
-  ${PROG_NAME} config [svc|all]       # show masked env (default: all)
-  ${PROG_NAME} secrets <svc>          # show raw env (DANGEROUS)
-  ${PROG_NAME} dsn [svc|all]          # print connection string template (default: all)
+  ${PROG_NAME} config [svc|all]       # 查看脱敏 env（默认：all）
+  ${PROG_NAME} secrets <svc>          # 打印原始 env（危险）
+  ${PROG_NAME} dsn [svc|all]          # 输出连接串模板（默认：all）
   ${PROG_NAME} backup mariadb|mongodb
-  ${PROG_NAME} backup files [svc]     # list local backup files
+  ${PROG_NAME} backup files [svc]     # 列出本地备份
   ${PROG_NAME} backup prune [svc] [days]
-  ${PROG_NAME} backup enable <svc>    # schedule daily backup via crontab
+  ${PROG_NAME} backup enable <svc>    # crontab 定时备份
   ${PROG_NAME} backup disable <svc>
   ${PROG_NAME} backup list
   ${PROG_NAME} restore <svc> <file>   # mariadb|mongodb
-  ${PROG_NAME} remove <svc>           # stop containers
-  ${PROG_NAME} purge <svc>            # stop + delete data dir
+  ${PROG_NAME} remove <svc>           # 停止容器
+  ${PROG_NAME} purge <svc>            # 停止 + 删除数据目录
   ${PROG_NAME} export-config <svc> [out.tgz]
   ${PROG_NAME} import-config <svc> <file.tgz>
   ${PROG_NAME} config-path <svc>
   ${PROG_NAME} config-edit <svc>
-  ${PROG_NAME} firewall       # whitelist helper (root)
+  ${PROG_NAME} firewall              # 防火墙白名单（root）
+  ${PROG_NAME} uninstall [script|all]
   ${PROG_NAME} self-update [url]
   ${PROG_NAME} --version
 EOF
@@ -1947,27 +2166,36 @@ main() {
       ;;
     logs)
       shift
-      if [[ "${1:-}" == "all" ]]; then logs_all; else logs_service "${1:?service required}"; fi
+      if [[ "${1:-}" == "all" ]]; then logs_all; else logs_service "${1:?需要服务名}"; fi
       ;;
     config)
       shift
       if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then show_env_all; else show_env "${1}"; fi
       ;;
-    secrets) shift; secrets_service "${1:?service required}" ;;
+    secrets) shift; secrets_service "${1:?需要服务名}" ;;
     dsn)
       shift
       if [[ "${1:-}" == "all" || -z "${1:-}" ]]; then dsn_all; else dsn_service "${1}"; fi
       ;;
     backup) shift; backup "$@" ;;
-    restore) shift; restore_service "${1:?service required}" "${2:?backup file required}" ;;
-    remove) shift; remove_service "${1:?service required}" ;;
-    purge) shift; purge_service "${1:?service required}" ;;
-    export-config) shift; export_config "${1:?service required}" "${2:-}" ;;
-    import-config) shift; import_config "${1:?service required}" "${2:?config file required}" ;;
-    config-path) shift; config_path "${1:?service required}" ;;
-    config-edit) shift; config_edit "${1:?service required}" ;;
+    restore) shift; restore_service "${1:?需要服务名}" "${2:?需要备份文件}" ;;
+    remove) shift; remove_service "${1:?需要服务名}" ;;
+    purge) shift; purge_service "${1:?需要服务名}" ;;
+    export-config) shift; export_config "${1:?需要服务名}" "${2:-}" ;;
+    import-config) shift; import_config "${1:?需要服务名}" "${2:?需要配置文件}" ;;
+    config-path) shift; config_path "${1:?需要服务名}" ;;
+    config-edit) shift; config_edit "${1:?需要服务名}" ;;
     firewall) shift; configure_firewall_menu ;;
     self-update) shift; self_update "$@" ;;
+    uninstall)
+      shift || true
+      case "${1:-}" in
+        script) uninstall_script ;;
+        all) uninstall_all ;;
+        "" ) menu_uninstall ;;
+        *) die "用法：${PROG_NAME} uninstall [script|all]" ;;
+      esac
+      ;;
     help|-h|--help) usage ;;
     *)
       # Default to menu for unknown (friendlier).
@@ -2009,6 +2237,7 @@ entry() {
         ;;
     esac
   done
+  require_root
   bootstrap_menu "${1:-menu}"
   main "$@"
 }
