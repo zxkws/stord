@@ -349,6 +349,10 @@ compose() {
   ${cb} --project-directory "${svc_dir}" -f "${f}" "$@"
 }
 
+compose_escape_env() {
+  printf "\$\$%s" "$1"
+}
+
 mask_value() {
   local v="${1:-}"
   if [[ -z "${v}" ]]; then
@@ -770,7 +774,7 @@ collation-server=utf8mb4_unicode_ci
       - --collation-server=utf8mb4_unicode_ci
       - --skip-name-resolve
     healthcheck:
-      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -p\\$\\$MARIADB_ROOT_PASSWORD --silent\"]
+      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -p$(compose_escape_env MARIADB_ROOT_PASSWORD) --silent\"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -865,7 +869,7 @@ processManagement:
       - ./conf/mongod.conf:/etc/mongod.conf:ro
     command: [\"mongod\", \"--config\", \"/etc/mongod.conf\"]
     healthcheck:
-      test: [\"CMD-SHELL\", \"mongosh --quiet --username \\$\\$MONGO_INITDB_ROOT_USERNAME --password \\$\\$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.runCommand({ ping: 1 }).ok' | grep 1\"]
+      test: [\"CMD-SHELL\", \"mongosh --quiet --username $(compose_escape_env MONGO_INITDB_ROOT_USERNAME) --password $(compose_escape_env MONGO_INITDB_ROOT_PASSWORD) --authenticationDatabase admin --eval 'db.runCommand({ ping: 1 }).ok' | grep 1\"]
       interval: 10s
       timeout: 10s
       retries: 12
@@ -946,7 +950,7 @@ save 60 10000
       - ./conf/redis.conf:/usr/local/etc/redis/redis.conf:ro
     command: [\"redis-server\", \"/usr/local/etc/redis/redis.conf\"]
     healthcheck:
-      test: [\"CMD-SHELL\", \"redis-cli -a \\$\\$REDIS_PASSWORD ping | grep PONG\"]
+      test: [\"CMD-SHELL\", \"redis-cli -a $(compose_escape_env REDIS_PASSWORD) ping | grep PONG\"]
       interval: 10s
       timeout: 5s
       retries: 12
