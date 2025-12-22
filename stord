@@ -112,6 +112,26 @@ docker_proxy_env() {
   printf "%s\n" "${envs[@]}"
 }
 
+ssh_cmd() {
+  local host="$1"; shift
+  local -a opts=()
+  if [[ -n "${STORD_SSH_OPTS:-}" ]]; then
+    # shellcheck disable=SC2206
+    opts=(${STORD_SSH_OPTS})
+  fi
+  ssh "${opts[@]}" "${host}" "$@"
+}
+
+scp_cmd() {
+  local src="$1" dest="$2"
+  local -a opts=()
+  if [[ -n "${STORD_SSH_OPTS:-}" ]]; then
+    # shellcheck disable=SC2206
+    opts=(${STORD_SSH_OPTS})
+  fi
+  scp "${opts[@]}" "${src}" "${dest}"
+}
+
 ver_cmp() {
   # Compare two dotted versions (e.g. 0.2.10 vs 0.2.2).
   # Prints -1, 0, or 1.
@@ -555,6 +575,7 @@ container_name() {
 
 container_state() {
   local svc="${1:?需要服务名}"
+  have docker || return 0
   local name
   name="$(container_name "${svc}")"
   docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || true
@@ -562,6 +583,7 @@ container_state() {
 
 container_health() {
   local svc="${1:?需要服务名}"
+  have docker || return 0
   local name
   name="$(container_name "${svc}")"
   docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${name}" 2>/dev/null || true
@@ -1289,6 +1311,182 @@ import_config() {
 
   (cd "${svc_dir}" && tar -xzf "${file}")
   say "导入完成。"
+}
+
+migrate_export() {
+  require tar
+  local svc="${1:?需要服务名}"
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  [[ -d "${svc_dir}" ]] || die "服务未部署：${svc}"
+  local ts out
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  out="${2:-${STORD_BACKUPS_DIR}/${PROG_NAME}-${svc}-bundle-${ts}.tgz}"
+  mkdir -p "$(dirname "${out}")"
+
+  say "迁移打包（含数据）：${svc}"
+  say "- 来源：${svc_dir}"
+  say "- 目标：${out}"
+  warn "将包含 ./data（可能较大）。"
+
+  if ! confirm "继续打包？"; then
+    say "已取消。"
+    return 0
+  fi
+
+  local was_running=0 state
+  state="$(container_state "${svc}")"
+  if [[ "${state}" == "running" ]]; then
+    warn "当前容器正在运行，打包可能不一致。"
+    if confirm "临时停止服务以确保一致性？"; then
+      ensure_compose
+      compose "${svc}" down || true
+      was_running=1
+    fi
+  fi
+
+  (cd "${svc_dir}" && tar -czf "${out}" .)
+  say "打包完成：${out}"
+  say "拷贝示例：scp ${out} root@<target>:/opt/${PROG_NAME}/backups/"
+
+  if [[ "${was_running}" == "1" ]]; then
+    say "恢复服务：${svc}"
+    compose_up_checked "${svc}" || warn "服务恢复失败，请检查：${PROG_NAME} logs ${svc}"
+  fi
+}
+
+migrate_import() {
+  require tar
+  local svc="${1:?需要服务名}"
+  local file="${2:?需要迁移文件（.tgz）}"
+  [[ -f "${file}" ]] || die "文件不存在：${file}"
+
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  local ts backup state
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+
+  say "迁移导入（含数据）：${svc}"
+  say "- 目录：${svc_dir}"
+  say "- 文件：${file}"
+
+  state="$(container_state "${svc}")"
+  if [[ "${state}" == "running" ]]; then
+    warn "目标容器正在运行。"
+    if confirm "先停止服务？"; then
+      ensure_compose
+      compose "${svc}" down || true
+    else
+      warn "继续导入可能失败或覆盖数据。"
+    fi
+  fi
+
+  if [[ -d "${svc_dir}" ]] && ! is_dir_empty "${svc_dir}"; then
+    backup="${svc_dir}.bak-${ts}"
+    warn "目标目录非空：${svc_dir}"
+    if confirm "将现有目录移动到 ${backup}？"; then
+      mv "${svc_dir}" "${backup}"
+    else
+      die "已取消。"
+    fi
+  fi
+
+  mkdir -p "${svc_dir}"
+  warn "导入会覆盖目标目录内容，包含 ./data。"
+  if ! confirm "继续导入？"; then
+    say "已取消。"
+    return 0
+  fi
+
+  (cd "${svc_dir}" && tar -xzf "${file}")
+  record_add "service" "${svc_dir}" "服务 ${svc}（迁移导入）"
+  say "导入完成。"
+
+  [[ -f "${svc_dir}/docker-compose.yml" ]] || warn "导入后缺少 docker-compose.yml"
+  [[ -f "${svc_dir}/.env" ]] || warn "导入后缺少 .env"
+
+  local port bind eff_port
+  port="$(env_get "${svc}" STORE_PORT || true)"
+  bind="$(env_get "${svc}" STORE_BIND || true)"
+  eff_port="${port:-$(svc_default_port "${svc}")}"
+  if [[ -n "${eff_port}" ]] && port_in_use "${eff_port}"; then
+    warn "端口 ${eff_port} 可能已被占用，请检查并按需修改 .env"
+  fi
+  if [[ -n "${bind}" ]]; then
+    warn_if_public_bind "${bind}" "${eff_port}" "${svc}"
+  fi
+
+  if confirm "现在启动服务？"; then
+    compose_up_checked "${svc}" || warn "启动失败，请检查：${PROG_NAME} logs ${svc}"
+  else
+    say "可稍后执行：${PROG_NAME} start ${svc}"
+  fi
+}
+
+migrate_pull() {
+  require ssh
+  require scp
+  local svc="${1:?需要服务名}"
+  local src="${2:?需要源地址（user@host 或 user@host:/path）}"
+  local local_file="${3:-}"
+
+  local host path
+  if [[ "${src}" == *":"* ]]; then
+    host="${src%%:*}"
+    path="${src#*:}"
+    [[ -n "${host}" && -n "${path}" ]] || die "源地址格式错误：${src}"
+  else
+    host="${src}"
+    path=""
+  fi
+
+  local ts remote_tmp
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -z "${path}" ]]; then
+    remote_tmp="/tmp/${PROG_NAME}-${svc}-bundle-${ts}.tgz"
+    say "远程打包：${host} -> ${remote_tmp}"
+    local remote_cmd
+    remote_cmd="${STORD_REMOTE_CMD:-${PROG_NAME}}"
+    ssh_cmd "${host}" "${remote_cmd}" migrate export "${svc}" "${remote_tmp}"
+    path="${remote_tmp}"
+  fi
+
+  local dest
+  if [[ -n "${local_file}" ]]; then
+    dest="${local_file}"
+  else
+    dest="${STORD_BACKUPS_DIR}/$(basename "${path}")"
+  fi
+  mkdir -p "$(dirname "${dest}")"
+  if [[ -e "${dest}" ]]; then
+    warn "本地已存在：${dest}"
+    if ! confirm "覆盖该文件？"; then
+      say "已取消。"
+      return 0
+    fi
+    rm -f "${dest}"
+  fi
+
+  say "拉取：${host}:${path} -> ${dest}"
+  scp_cmd "${host}:${path}" "${dest}"
+  say "已下载：${dest}"
+
+  if [[ -n "${remote_tmp}" ]]; then
+    if confirm "删除远端临时包？"; then
+      ssh_cmd "${host}" rm -f "${remote_tmp}" || true
+    fi
+  fi
+
+  migrate_import "${svc}" "${dest}"
+}
+
+migrate() {
+  local action="${1:-}"
+  local svc="${2:-}"
+  case "${action}" in
+    export) migrate_export "${svc:?需要服务名}" "${3:-}" ;;
+    import) migrate_import "${svc:?需要服务名}" "${3:?需要迁移文件}" ;;
+    pull|fetch) migrate_pull "${svc:?需要服务名}" "${3:?需要源地址}" "${4:-}" ;;
+    *) die "用法：${PROG_NAME} migrate {export|import|pull} <svc> [file|source]" ;;
+  esac
 }
 
 list_services() {
@@ -2046,6 +2244,7 @@ menu_service_actions() {
     say "12) 导入配置（tgz）"
     say "13) 移除服务（仅停止）"
     say "14) 彻底清理（删除数据）"
+    say "15) 迁移（打包/导入）"
     say "0) 返回"
     say
 
@@ -2134,6 +2333,52 @@ menu_service_actions() {
           purge_service "${svc}"
         fi
         ;;
+      15)
+        if [[ "${svc}" == "all" ]]; then
+          warn "迁移需指定服务。"
+        else
+          menu_migrate_service "${svc}"
+        fi
+        ;;
+      0) return 0 ;;
+      *) say >&2 "未知选项。" ;;
+    esac
+  done
+}
+
+menu_migrate_service() {
+  local svc="${1:?需要服务名}"
+  while true; do
+    say
+    say "迁移：${svc}"
+    say "1) 导出迁移包（含数据）"
+    say "2) 导入迁移包（含数据）"
+    say "3) 远程拉取并导入"
+    say "0) 返回"
+    say
+    local m
+    m="$(menu_choice_num "选择" "1")"
+    case "${m}" in
+      1)
+        local out
+        out="$(prompt "输出文件（可选）" "")"
+        if [[ -n "${out}" ]]; then migrate_export "${svc}" "${out}"; else migrate_export "${svc}"; fi
+        ;;
+      2)
+        local f
+        f="$(prompt "迁移包路径" "")"
+        migrate_import "${svc}" "${f}"
+        ;;
+      3)
+        local src out
+        src="$(prompt "源地址（user@host 或 user@host:/path）" "")"
+        out="$(prompt "本地保存路径（可选）" "")"
+        if [[ -n "${out}" ]]; then
+          migrate_pull "${svc}" "${src}" "${out}"
+        else
+          migrate_pull "${svc}" "${src}"
+        fi
+        ;;
       0) return 0 ;;
       *) say >&2 "未知选项。" ;;
     esac
@@ -2163,7 +2408,7 @@ menu_select_service() {
         list_services | sed 's/^/ - /' >&2
         ;;
       0) echo ""; return 0 ;;
-      *) say "未知选项。" ;;
+      *) say >&2 "未知选项。" ;;
     esac
   done
 }
@@ -2301,6 +2546,9 @@ ${PROG_NAME} - 单机存储部署工具
   ${PROG_NAME} purge <svc>            # 停止 + 删除数据目录
   ${PROG_NAME} export-config <svc> [out.tgz]
   ${PROG_NAME} import-config <svc> <file.tgz>
+  ${PROG_NAME} migrate export <svc> [out.tgz]
+  ${PROG_NAME} migrate import <svc> <file.tgz>
+  ${PROG_NAME} migrate pull <svc> <user@host|user@host:/path> [local.tgz]
   ${PROG_NAME} config-path <svc>
   ${PROG_NAME} config-edit <svc>
   ${PROG_NAME} firewall              # 防火墙白名单（root）
@@ -2354,6 +2602,7 @@ main() {
     purge) shift; purge_service "${1:?需要服务名}" ;;
     export-config) shift; export_config "${1:?需要服务名}" "${2:-}" ;;
     import-config) shift; import_config "${1:?需要服务名}" "${2:?需要配置文件}" ;;
+    migrate) shift; migrate "$@" ;;
     config-path) shift; config_path "${1:?需要服务名}" ;;
     config-edit) shift; config_edit "${1:?需要服务名}" ;;
     firewall) shift; configure_firewall_menu ;;
