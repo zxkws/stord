@@ -553,6 +553,59 @@ container_name() {
   echo "${PROG_NAME}-${svc}"
 }
 
+container_state() {
+  local svc="${1:?需要服务名}"
+  local name
+  name="$(container_name "${svc}")"
+  docker inspect -f '{{.State.Status}}' "${name}" 2>/dev/null || true
+}
+
+container_health() {
+  local svc="${1:?需要服务名}"
+  local name
+  name="$(container_name "${svc}")"
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "${name}" 2>/dev/null || true
+}
+
+wait_container_running() {
+  local svc="${1:?需要服务名}"
+  local tries="${2:-12}"
+  local delay="${3:-1}"
+  local state
+  for ((i=0; i<tries; i++)); do
+    state="$(container_state "${svc}")"
+    if [[ "${state}" == "running" ]]; then
+      return 0
+    fi
+    if [[ "${state}" == "exited" || "${state}" == "dead" ]]; then
+      break
+    fi
+    sleep "${delay}"
+  done
+  return 1
+}
+
+compose_up_checked() {
+  local svc="${1:?需要服务名}"
+  if ! compose "${svc}" up -d; then
+    warn "docker compose up 失败：${svc}"
+    return 1
+  fi
+  if ! wait_container_running "${svc}"; then
+    local state
+    state="$(container_state "${svc}")"
+    warn "容器未运行：$(container_name "${svc}")（状态：${state:-unknown}）"
+    compose "${svc}" ps || true
+    return 1
+  fi
+  local health
+  health="$(container_health "${svc}")"
+  if [[ -n "${health}" && "${health}" != "healthy" ]]; then
+    warn "容器健康检查状态：${health}"
+  fi
+  return 0
+}
+
 warn_if_public_bind() {
   local bind="$1" port="$2" svc="$3"
   if [[ "${bind}" == "0.0.0.0" ]]; then
@@ -791,7 +844,10 @@ collation-server=utf8mb4_unicode_ci
     return 0
   fi
 
-  compose "${svc}" up -d
+  if ! compose_up_checked "${svc}"; then
+    warn "MariaDB 启动失败，请检查镜像/网络或执行：${PROG_NAME} logs mariadb"
+    return 1
+  fi
   say "MariaDB 已启动。"
   say
   say "连接信息："
@@ -887,7 +943,10 @@ processManagement:
     return 0
   fi
 
-  compose "${svc}" up -d
+  if ! compose_up_checked "${svc}"; then
+    warn "MongoDB 启动失败，请检查镜像/网络或执行：${PROG_NAME} logs mongodb"
+    return 1
+  fi
   say "MongoDB 已启动。"
   say
   say "连接信息："
@@ -968,7 +1027,10 @@ save 60 10000
     return 0
   fi
 
-  compose "${svc}" up -d
+  if ! compose_up_checked "${svc}"; then
+    warn "Redis 启动失败，请检查镜像/网络或执行：${PROG_NAME} logs redis"
+    return 1
+  fi
   say "Redis 已启动。"
   say
   say "连接信息："
@@ -1896,7 +1958,7 @@ menu_uninstall() {
       3) uninstall_all_services ;;
       4) uninstall_single_service ;;
       0) return 0 ;;
-      *) say "未知选项。" ;;
+      *) say >&2 "未知选项。" ;;
     esac
   done
 }
@@ -1961,7 +2023,7 @@ menu_choice_num() {
       printf "%s" "${out}"
       return 0
     fi
-    say "请输入数字。"
+    say >&2 "请输入数字。"
   done
 }
 
@@ -2073,22 +2135,22 @@ menu_service_actions() {
         fi
         ;;
       0) return 0 ;;
-      *) say "未知选项。" ;;
+      *) say >&2 "未知选项。" ;;
     esac
   done
 }
 
 menu_select_service() {
   while true; do
-    say
-    say "选择服务："
-    say "1) MariaDB"
-    say "2) MongoDB"
-    say "3) Redis"
-    say "4) 全部"
-    say "5) 列出已部署"
-    say "0) 返回"
-    say
+    say >&2
+    say >&2 "选择服务："
+    say >&2 "1) MariaDB"
+    say >&2 "2) MongoDB"
+    say >&2 "3) Redis"
+    say >&2 "4) 全部"
+    say >&2 "5) 列出已部署"
+    say >&2 "0) 返回"
+    say >&2
     local s
     s="$(menu_choice_num "选择" "1")"
     case "${s}" in
@@ -2097,8 +2159,8 @@ menu_select_service() {
       3) echo "redis"; return 0 ;;
       4) echo "all"; return 0 ;;
       5)
-        say "已部署："
-        list_services | sed 's/^/ - /'
+        say >&2 "已部署："
+        list_services | sed 's/^/ - /' >&2
         ;;
       0) echo ""; return 0 ;;
       *) say "未知选项。" ;;
