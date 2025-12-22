@@ -231,6 +231,31 @@ prompt_secret() {
   printf "%s" "${out}"
 }
 
+prompt_secret_default() {
+  local label="$1"
+  local def="${2:-}"
+  local hint="${3:-<random>}"
+  local out
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+    if [[ -n "${def}" ]]; then
+      printf "%s" "${def}"
+    else
+      printf "%s" ""
+    fi
+    return 0
+  fi
+  if [[ -n "${def}" ]]; then
+    hint="保持原值"
+  fi
+  read -r -s -u "${STORD_INPUT_FD}" -p "${label} [${hint}]: " out || true
+  printf "\n" >&2
+  if [[ -z "${out}" && -n "${def}" ]]; then
+    printf "%s" "${def}"
+  else
+    printf "%s" "${out}"
+  fi
+}
+
 random_hex() {
   local n="${1:-16}"
   if have openssl; then
@@ -531,11 +556,54 @@ service_dir() {
   echo "${STORD_SERVICES_DIR}/$1"
 }
 
+maybe_handle_existing_deploy() {
+  local svc="${1:?需要服务名}"
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
+  if [[ -f "${svc_dir}/docker-compose.yml" ]]; then
+    say "检测到已部署服务：${svc}"
+    say "- 目录：${svc_dir}"
+    if [[ ! -f "${svc_dir}/.env" ]]; then
+      warn "配置文件缺失：${svc_dir}/.env"
+    fi
+    if [[ "${STORD_NON_INTERACTIVE}" == "1" ]]; then
+      warn "非交互模式下不执行重新部署，请使用 start/restart。"
+      return 1
+    fi
+    say "1) 直接启动/重启"
+    say "2) 重新配置并覆盖"
+    say "3) 取消"
+    local c
+    c="$(menu_choice_num "选择" "1")"
+    case "${c}" in
+      1)
+        ensure_compose || return 1
+        compose_up_checked "${svc}" || warn "启动失败，请检查：${PROG_NAME} logs ${svc}"
+        return 1
+        ;;
+      2) return 0 ;;
+      3) die "已取消" ;;
+      *) say "未知选项。"; return 1 ;;
+    esac
+  fi
+  return 0
+}
+
 env_get() {
   local svc="$1" key="$2"
   local envf; envf="$(service_dir "${svc}")/.env"
   [[ -f "${envf}" ]] || return 1
   grep -E "^${key}=" "${envf}" | head -n 1 | cut -d= -f2- || true
+}
+
+env_default() {
+  local svc="$1" key="$2" def="${3:-}"
+  local v
+  v="$(env_get "${svc}" "${key}" || true)"
+  if [[ -n "${v}" ]]; then
+    printf "%s" "${v}"
+  else
+    printf "%s" "${def}"
+  fi
 }
 
 svc_default_port() {
@@ -641,6 +709,22 @@ is_valid_port() {
   (( p >= 1 && p <= 65535 ))
 }
 
+docker_port_owner() {
+  local port="${1:?需要端口}"
+  have docker || return 0
+  docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null | \
+    grep -E "[:.]${port}->" | head -n 1 || true
+}
+
+port_in_use_hint() {
+  local port="${1:?需要端口}"
+  local owner
+  owner="$(docker_port_owner "${port}")"
+  if [[ -n "${owner}" ]]; then
+    warn "端口 ${port} 已被容器占用：${owner}"
+  fi
+}
+
 port_in_use_proc() {
   local port="${1:?需要端口}"
   is_valid_port "${port}" || return 1
@@ -727,6 +811,7 @@ select_port() {
   if confirm "使用默认端口 ${def}？"; then
     if port_in_use "${def}"; then
       warn "端口 ${def} 已被占用，需选择其他端口。"
+      port_in_use_hint "${def}"
     else
       echo "${def}"
       return 0
@@ -753,6 +838,7 @@ select_port() {
     fi
 
     warn "端口 ${port} 已被占用。"
+    port_in_use_hint "${port}"
     say "1) 使用随机可用端口"
     say "2) 输入其他端口"
     say "3) 取消"
@@ -788,17 +874,64 @@ deploy_mariadb() {
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf.d"
   record_add "service" "${svc_dir}" "服务 mariadb"
 
-  local bind default_bind port rootpw db user pass buf_mb
-  default_bind="0.0.0.0"
-  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${default_bind}")"
-  port="$(select_port "${svc}" "MariaDB" "3306")"
-  db="$(prompt "数据库名" "appdb")"
-  user="$(prompt "应用用户名" "app")"
+  if ! maybe_handle_existing_deploy "${svc}"; then
+    return 0
+  fi
 
-  rootpw="$(prompt_secret "Root 密码" "<random>")"
+  local bind default_bind port rootpw db user pass buf_mb
+  local old_bind old_port old_db old_user old_pass old_rootpw data_existing=0
+  old_bind="$(env_get "${svc}" STORE_BIND || true)"
+  old_port="$(env_get "${svc}" STORE_PORT || true)"
+  old_db="$(env_get "${svc}" MARIADB_DATABASE || true)"
+  old_user="$(env_get "${svc}" MARIADB_USER || true)"
+  old_pass="$(env_get "${svc}" MARIADB_PASSWORD || true)"
+  old_rootpw="$(env_get "${svc}" MARIADB_ROOT_PASSWORD || true)"
+
+  default_bind="${old_bind:-0.0.0.0}"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${default_bind}")"
+  port="$(select_port "${svc}" "MariaDB" "${old_port:-3306}")"
+  db="$(prompt "数据库名" "$(env_default "${svc}" MARIADB_DATABASE "appdb")")"
+  user="$(prompt "应用用户名" "$(env_default "${svc}" MARIADB_USER "app")")"
+
+  rootpw="$(prompt_secret_default "Root 密码" "${old_rootpw}")"
   if [[ -z "${rootpw}" ]]; then rootpw="$(random_hex 16)"; fi
-  pass="$(prompt_secret "应用用户密码" "<random>")"
+  pass="$(prompt_secret_default "应用用户密码" "${old_pass}")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
+
+  local data_dir="${svc_dir}/data"
+  if [[ -d "${data_dir}" ]] && ! is_dir_empty "${data_dir}"; then
+    data_existing=1
+    warn "检测到已有数据目录：${data_dir}"
+    if [[ -z "${old_rootpw}${old_pass}${old_db}${old_user}" ]]; then
+      warn "未发现旧 .env，实际账号密码可能不是当前输入。"
+    else
+      local changed=0
+      if [[ -n "${old_rootpw}" && "${rootpw}" != "${old_rootpw}" ]]; then
+        warn "root 密码已变更，但已有数据会保持旧密码。"
+        changed=1
+      fi
+      if [[ -n "${old_pass}" && "${pass}" != "${old_pass}" ]]; then
+        warn "应用用户密码已变更，但已有数据会保持旧密码。"
+        changed=1
+      fi
+      if [[ -n "${old_db}" && "${db}" != "${old_db}" ]]; then
+        warn "数据库名已变更，已有数据仍为 ${old_db}。"
+        changed=1
+      fi
+      if [[ -n "${old_user}" && "${user}" != "${old_user}" ]]; then
+        warn "用户名已变更，已有数据仍为 ${old_user}。"
+        changed=1
+      fi
+      if [[ "${changed}" == "1" ]]; then
+        if ! confirm "继续使用新配置写入 .env？"; then
+          rootpw="${old_rootpw:-${rootpw}}"
+          pass="${old_pass:-${pass}}"
+          db="${old_db:-${db}}"
+          user="${old_user:-${user}}"
+        fi
+      fi
+    fi
+  fi
 
   buf_mb="$(prompt "InnoDB 缓冲池（MB）" "$(suggest_mariadb_buffer_pool_mb)")"
   if [[ ! "${buf_mb}" =~ ^[0-9]+$ ]]; then die "缓冲池必须是整数（MB）"; fi
@@ -879,6 +1012,9 @@ collation-server=utf8mb4_unicode_ci
   say "- user：${user}"
   say "- pass：${pass}"
   say "- root：${rootpw}"
+  if [[ "${data_existing}" == "1" ]]; then
+    warn "已有数据目录存在，实际密码可能仍为旧值。"
+  fi
 }
 
 deploy_mongodb() {
@@ -891,12 +1027,47 @@ deploy_mongodb() {
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
   record_add "service" "${svc_dir}" "服务 mongodb"
 
+  if ! maybe_handle_existing_deploy "${svc}"; then
+    return 0
+  fi
+
   local bind port rootuser rootpass cache_mb cache_gb
-  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "0.0.0.0")"
-  port="$(select_port "${svc}" "MongoDB" "27017")"
-  rootuser="$(prompt "Mongo root 用户名" "root")"
-  rootpass="$(prompt_secret "Mongo root 密码" "<random>")"
+  local old_bind old_port old_user old_pass data_existing=0
+  old_bind="$(env_get "${svc}" STORE_BIND || true)"
+  old_port="$(env_get "${svc}" STORE_PORT || true)"
+  old_user="$(env_get "${svc}" MONGO_INITDB_ROOT_USERNAME || true)"
+  old_pass="$(env_get "${svc}" MONGO_INITDB_ROOT_PASSWORD || true)"
+
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-0.0.0.0}")"
+  port="$(select_port "${svc}" "MongoDB" "${old_port:-27017}")"
+  rootuser="$(prompt "Mongo root 用户名" "$(env_default "${svc}" MONGO_INITDB_ROOT_USERNAME "root")")"
+  rootpass="$(prompt_secret_default "Mongo root 密码" "${old_pass}")"
   if [[ -z "${rootpass}" ]]; then rootpass="$(random_hex 16)"; fi
+
+  local data_dir="${svc_dir}/data"
+  if [[ -d "${data_dir}" ]] && ! is_dir_empty "${data_dir}"; then
+    data_existing=1
+    warn "检测到已有数据目录：${data_dir}"
+    if [[ -z "${old_user}${old_pass}" ]]; then
+      warn "未发现旧 .env，实际账号密码可能不是当前输入。"
+    else
+      local changed=0
+      if [[ -n "${old_user}" && "${rootuser}" != "${old_user}" ]]; then
+        warn "root 用户名已变更，但已有数据会保持旧用户名。"
+        changed=1
+      fi
+      if [[ -n "${old_pass}" && "${rootpass}" != "${old_pass}" ]]; then
+        warn "root 密码已变更，但已有数据会保持旧密码。"
+        changed=1
+      fi
+      if [[ "${changed}" == "1" ]]; then
+        if ! confirm "继续使用新配置写入 .env？"; then
+          rootuser="${old_user:-${rootuser}}"
+          rootpass="${old_pass:-${rootpass}}"
+        fi
+      fi
+    fi
+  fi
 
   cache_mb="$(prompt "MongoDB WiredTiger 缓存（MB）" "$(suggest_mongodb_cache_mb)")"
   if [[ ! "${cache_mb}" =~ ^[0-9]+$ ]]; then
@@ -976,6 +1147,9 @@ processManagement:
   say "- port：${port}"
   say "- user：${rootuser}"
   say "- pass：${rootpass}"
+  if [[ "${data_existing}" == "1" ]]; then
+    warn "已有数据目录存在，实际密码可能仍为旧值。"
+  fi
 }
 
 deploy_redis() {
@@ -988,12 +1162,29 @@ deploy_redis() {
   mkdir -p "${svc_dir}/data" "${svc_dir}/conf"
   record_add "service" "${svc_dir}" "服务 redis"
 
+  if ! maybe_handle_existing_deploy "${svc}"; then
+    return 0
+  fi
+
   local bind port pass maxmem
-  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "0.0.0.0")"
-  port="$(select_port "${svc}" "Redis" "6379")"
-  maxmem="$(prompt "Redis maxmemory（如 128mb）" "$(suggest_redis_maxmem_mb)mb")"
-  pass="$(prompt_secret "Redis 密码" "<random>")"
+  local old_bind old_port old_pass old_maxmem
+  old_bind="$(env_get "${svc}" STORE_BIND || true)"
+  old_port="$(env_get "${svc}" STORE_PORT || true)"
+  old_pass="$(env_get "${svc}" REDIS_PASSWORD || true)"
+  old_maxmem="$(env_get "${svc}" REDIS_MAXMEM || true)"
+
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-0.0.0.0}")"
+  port="$(select_port "${svc}" "Redis" "${old_port:-6379}")"
+  maxmem="$(prompt "Redis maxmemory（如 128mb）" "${old_maxmem:-$(suggest_redis_maxmem_mb)mb}")"
+  pass="$(prompt_secret_default "Redis 密码" "${old_pass}")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
+
+  local data_dir="${svc_dir}/data"
+  if [[ -d "${data_dir}" ]] && ! is_dir_empty "${data_dir}"; then
+    if [[ -n "${old_pass}" && "${pass}" != "${old_pass}" ]]; then
+      warn "检测到已有数据目录，密码已变更会影响现有客户端连接。"
+    fi
+  fi
 
   write_file "${svc_dir}/.env" \
     "TZ=Asia/Seoul
