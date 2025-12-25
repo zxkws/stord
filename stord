@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.7"
+STORD_VERSION="0.2.8"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -37,6 +37,8 @@ STORD_BACKUPS_DIR="${STORD_BACKUPS_DIR:-${STORD_HOME}/backups}"
 STORD_STATE_DIR="${STORD_STATE_DIR:-${STORD_HOME}/state}"
 STORD_LOG_DIR="${STORD_LOG_DIR:-${STORD_HOME}/logs}"
 STORD_RECORD_FILE="${STORD_RECORD_FILE:-${STORD_STATE_DIR}/install-records}"
+STORD_TZ="${STORD_TZ:-UTC}"
+STORD_DB_TZ="${STORD_DB_TZ:-+00:00}"
 
 umask 077
 
@@ -60,6 +62,10 @@ say() {
 }
 warn() { printf "警告：%s\n" "$*" >&2; }
 die() { printf "错误：%s\n" "$*" >&2; exit 1; }
+
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+  die "需要 Bash >= 4.0（当前：${BASH_VERSION:-unknown}）"
+fi
 
 if [[ "${STORD_DEBUG}" == "1" ]]; then
   set -x
@@ -390,12 +396,47 @@ compose() {
   cb="$(compose_bin)" || die "未找到 docker compose（请安装 Docker + compose 插件）"
 
   # Ensure `.env` and relative paths resolve against the service directory.
-  # shellcheck disable=SC2086
-  ${cb} --project-directory "${svc_dir}" -f "${f}" "$@"
+  # Avoid `--project-directory` for docker-compose v1 compatibility.
+  case "${cb}" in
+    "docker compose")
+      (cd "${svc_dir}" && docker compose -f docker-compose.yml "$@")
+      ;;
+    "docker-compose")
+      (cd "${svc_dir}" && docker-compose -f docker-compose.yml "$@")
+      ;;
+    *)
+      die "未知 compose 命令：${cb}"
+      ;;
+  esac
 }
 
 compose_escape_env() {
   printf "\$\$%s" "$1"
+}
+
+is_safe_env_value() {
+  local v="${1:-}"
+  [[ -n "${v}" ]] || return 1
+  [[ "${v}" != *$'\n'* && "${v}" != *$'\r'* ]] || return 1
+  [[ "${v}" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]
+}
+
+require_safe_env_value() {
+  local label="$1" v="${2:-}"
+  if ! is_safe_env_value "${v}"; then
+    die "${label} 包含不支持的字符（仅允许字母数字及 _@%+=:,./-；且不能包含空格/引号/#/$/换行）"
+  fi
+}
+
+is_mariadb_time_zone() {
+  local v="${1:-}"
+  [[ "${v}" == "SYSTEM" ]] || [[ "${v}" =~ ^[+-][0-9]{2}:[0-9]{2}$ ]]
+}
+
+is_redis_maxmem() {
+  local v="${1:-}"
+  [[ -n "${v}" ]] || return 1
+  [[ "${v,,}" =~ ^[0-9]+(kb|mb|gb)$ ]]
 }
 
 mask_value() {
@@ -936,12 +977,23 @@ deploy_mariadb() {
   buf_mb="$(prompt "InnoDB 缓冲池（MB）" "$(suggest_mariadb_buffer_pool_mb)")"
   if [[ ! "${buf_mb}" =~ ^[0-9]+$ ]]; then die "缓冲池必须是整数（MB）"; fi
 
+  require_safe_env_value "绑定地址" "${bind}"
+  require_safe_env_value "端口" "${port}"
+  require_safe_env_value "数据库名" "${db}"
+  require_safe_env_value "用户名" "${user}"
+  require_safe_env_value "Root 密码" "${rootpw}"
+  require_safe_env_value "应用用户密码" "${pass}"
+  require_safe_env_value "TZ" "${STORD_TZ}"
+  if ! is_mariadb_time_zone "${STORD_DB_TZ}"; then
+    die "STORD_DB_TZ 无效：${STORD_DB_TZ}（示例：+00:00 或 SYSTEM）"
+  fi
+
   write_file "${svc_dir}/.env" \
     "MARIADB_ROOT_PASSWORD=${rootpw}
 MARIADB_DATABASE=${db}
 MARIADB_USER=${user}
 MARIADB_PASSWORD=${pass}
-TZ=Asia/Seoul
+TZ=${STORD_TZ}
 STORE_BIND=${bind}
 STORE_PORT=${port}
 "
@@ -960,7 +1012,7 @@ slow_query_log=1
 long_query_time=1
 log_queries_not_using_indexes=0
 skip_name_resolve=ON
-default_time_zone='+09:00'
+default_time_zone='${STORD_DB_TZ}'
 character-set-server=utf8mb4
 collation-server=utf8mb4_unicode_ci
 "
@@ -1075,10 +1127,16 @@ deploy_mongodb() {
   fi
   cache_gb="$(awk "BEGIN { printf \"%.3f\", ${cache_mb}/1024 }")"
 
+  require_safe_env_value "绑定地址" "${bind}"
+  require_safe_env_value "端口" "${port}"
+  require_safe_env_value "Mongo root 用户名" "${rootuser}"
+  require_safe_env_value "Mongo root 密码" "${rootpass}"
+  require_safe_env_value "TZ" "${STORD_TZ}"
+
   write_file "${svc_dir}/.env" \
     "MONGO_INITDB_ROOT_USERNAME=${rootuser}
 MONGO_INITDB_ROOT_PASSWORD=${rootpass}
-TZ=Asia/Seoul
+TZ=${STORD_TZ}
 STORE_BIND=${bind}
 STORE_PORT=${port}
 MONGO_CACHE_GB=${cache_gb}
@@ -1179,6 +1237,14 @@ deploy_redis() {
   pass="$(prompt_secret_default "Redis 密码" "${old_pass}")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
 
+  require_safe_env_value "绑定地址" "${bind}"
+  require_safe_env_value "端口" "${port}"
+  require_safe_env_value "Redis 密码" "${pass}"
+  require_safe_env_value "TZ" "${STORD_TZ}"
+  if ! is_redis_maxmem "${maxmem}"; then
+    die "Redis maxmemory 无效：${maxmem}（示例：128mb / 1gb）"
+  fi
+
   local data_dir="${svc_dir}/data"
   if [[ -d "${data_dir}" ]] && ! is_dir_empty "${data_dir}"; then
     if [[ -n "${old_pass}" && "${pass}" != "${old_pass}" ]]; then
@@ -1187,7 +1253,7 @@ deploy_redis() {
   fi
 
   write_file "${svc_dir}/.env" \
-    "TZ=Asia/Seoul
+    "TZ=${STORD_TZ}
 STORE_BIND=${bind}
 STORE_PORT=${port}
 REDIS_PASSWORD=${pass}
@@ -1831,8 +1897,8 @@ backup_mariadb() {
   local svc_dir="${STORD_SERVICES_DIR}/mariadb"
   [[ -f "${svc_dir}/.env" ]] || die "mariadb 未部署"
   local db rootpw
-  db="$(grep -E '^MARIADB_DATABASE=' "${svc_dir}/.env" | cut -d= -f2-)"
-  rootpw="$(grep -E '^MARIADB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
+  db="$(env_get mariadb MARIADB_DATABASE || true)"
+  rootpw="$(env_get mariadb MARIADB_ROOT_PASSWORD || true)"
   [[ -n "${db}" ]] || die "缺少 MARIADB_DATABASE"
   [[ -n "${rootpw}" ]] || die "缺少 MARIADB_ROOT_PASSWORD"
 
@@ -1848,10 +1914,10 @@ backup_mariadb() {
 
   say "备份 MariaDB -> ${out}"
   if [[ "${out}" == *.gz ]]; then
-    docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
+    docker exec -i "$(container_name mariadb)" mysqldump -uroot "-p${rootpw}" --single-transaction --quick "${db}" \
       | gzip -9 > "${out}"
   else
-    docker exec -i "$(container_name mariadb)" sh -c "mysqldump -uroot -p\"${rootpw}\" --single-transaction --quick \"${db}\"" \
+    docker exec -i "$(container_name mariadb)" mysqldump -uroot "-p${rootpw}" --single-transaction --quick "${db}" \
       > "${out}"
   fi
   say "备份完成。"
@@ -1861,8 +1927,8 @@ backup_mongodb() {
   local svc_dir="${STORD_SERVICES_DIR}/mongodb"
   [[ -f "${svc_dir}/.env" ]] || die "mongodb 未部署"
   local user pass
-  user="$(grep -E '^MONGO_INITDB_ROOT_USERNAME=' "${svc_dir}/.env" | cut -d= -f2-)"
-  pass="$(grep -E '^MONGO_INITDB_ROOT_PASSWORD=' "${svc_dir}/.env" | cut -d= -f2-)"
+  user="$(env_get mongodb MONGO_INITDB_ROOT_USERNAME || true)"
+  pass="$(env_get mongodb MONGO_INITDB_ROOT_PASSWORD || true)"
   [[ -n "${user}" ]] || die "缺少 MONGO_INITDB_ROOT_USERNAME"
   [[ -n "${pass}" ]] || die "缺少 MONGO_INITDB_ROOT_PASSWORD"
 
@@ -1878,10 +1944,10 @@ backup_mongodb() {
 
   say "备份 MongoDB -> ${out}"
   if [[ "${out}" == *.gz ]]; then
-    docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
+    docker exec -i "$(container_name mongodb)" mongodump --username "${user}" --password "${pass}" --authenticationDatabase=admin --archive \
       | gzip -9 > "${out}"
   else
-    docker exec -i "$(container_name mongodb)" sh -c "mongodump --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive" \
+    docker exec -i "$(container_name mongodb)" mongodump --username "${user}" --password "${pass}" --authenticationDatabase=admin --archive \
       > "${out}"
   fi
   say "备份完成。"
@@ -2004,13 +2070,12 @@ restore_mariadb() {
     say "已取消。"
     return 0
   fi
-  local catcmd="cat"
   if [[ "${file}" == *.gz ]]; then
     have gzip || die "恢复 .gz 备份需要 gzip"
-    catcmd="gzip -dc"
+    gzip -dc "${file}" | docker exec -i "$(container_name mariadb)" mysql -uroot "-p${rootpw}" "${db}"
+  else
+    cat "${file}" | docker exec -i "$(container_name mariadb)" mysql -uroot "-p${rootpw}" "${db}"
   fi
-  # shellcheck disable=SC2086
-  ${catcmd} "${file}" | docker exec -i "$(container_name mariadb)" sh -c "mysql -uroot -p\"${rootpw}\" \"${db}\""
   say "恢复完成。"
 }
 
@@ -2026,18 +2091,22 @@ restore_mongodb() {
     say "已取消。"
     return 0
   fi
-  local drop_flag=""
+  local drop_flag=0
   if confirm "恢复前先删除已有集合？"; then
-    drop_flag="--drop"
+    drop_flag=1
   fi
 
-  local catcmd="cat"
+  local -a args=()
+  args+=(mongorestore --username "${user}" --password "${pass}" --authenticationDatabase=admin --archive)
+  if [[ "${drop_flag}" == "1" ]]; then
+    args+=(--drop)
+  fi
   if [[ "${file}" == *.gz ]]; then
     have gzip || die "恢复 .gz 备份需要 gzip"
-    catcmd="gzip -dc"
+    gzip -dc "${file}" | docker exec -i "$(container_name mongodb)" "${args[@]}"
+  else
+    cat "${file}" | docker exec -i "$(container_name mongodb)" "${args[@]}"
   fi
-  # shellcheck disable=SC2086
-  ${catcmd} "${file}" | docker exec -i "$(container_name mongodb)" sh -c "mongorestore --username=\"${user}\" --password=\"${pass}\" --authenticationDatabase=admin --archive ${drop_flag}"
   say "恢复完成。"
 }
 
@@ -2849,6 +2918,12 @@ entry() {
         ;;
     esac
   done
+  case "${1:-}" in
+    -v|--version|help|-h|--help)
+      main "$@"
+      return 0
+      ;;
+  esac
   require_root
   bootstrap_menu "${1:-menu}"
   main "$@"

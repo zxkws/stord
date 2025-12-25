@@ -121,6 +121,11 @@ stord dsn mariadb
 STORD_HOME=/data/stord stord doctor
 ```
 
+时区相关（可选）：
+
+- `STORD_TZ`：写入容器环境变量 `TZ`，默认 `UTC`
+- `STORD_DB_TZ`：MariaDB `default_time_zone`，默认 `+00:00`（也可用 `SYSTEM`）
+
 ## 卸载/清理
 
 仅卸载脚本：
