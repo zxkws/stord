@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.11"
+STORD_VERSION="0.2.12"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -28,7 +28,17 @@ require_root() {
 }
 
 default_home() {
-  echo "/opt/${PROG_NAME}"
+  local legacy="/opt/${PROG_NAME}"
+  # Backward compatible: keep using legacy path if it already exists.
+  if [[ -d "${legacy}" ]]; then
+    echo "${legacy}"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    echo "${HOME}/.${PROG_NAME}"
+    return 0
+  fi
+  echo "${legacy}"
 }
 
 STORD_HOME="${STORD_HOME:-$(default_home)}"
@@ -288,7 +298,7 @@ maybe_offer_update() {
     say
     say "发现新版本：${STORD_VERSION} -> ${rv}"
     if confirm "现在更新 ${PROG_NAME}？"; then
-      (STORD_ASSUME_YES=1 self_update)
+      (STORD_ASSUME_YES=1 self_update) || warn "更新失败（可能没有权限写入已安装位置）。可尝试：sudo -E ${PROG_NAME} self-update 或 ${PROG_NAME} install"
       say
     fi
   fi
@@ -316,6 +326,10 @@ record_list() {
 record_remove_path() {
   local path="$1"
   [[ -f "${STORD_RECORD_FILE}" ]] || return 0
+  if [[ ! -w "${STORD_RECORD_FILE}" ]]; then
+    warn "无法写入记录文件：${STORD_RECORD_FILE}（可能需要 sudo）"
+    return 0
+  fi
   local tmp
   tmp="$(mktemp)"
   awk -F'|' -v p="${path}" 'NF && $2!=p {print}' "${STORD_RECORD_FILE}" > "${tmp}"
@@ -331,7 +345,7 @@ ensure_dirs() {
     record_add "dir" "${STORD_LOG_DIR}" "日志目录"
     return 0
   fi
-  die "无法创建目录：${STORD_HOME}"
+  die "无法创建目录：${STORD_HOME}（请使用 sudo 或设置 STORD_HOME 到可写目录）"
 }
 
 mem_total_mb() {
@@ -561,7 +575,23 @@ show_env_all() {
 
 ensure_docker() {
   if have docker; then
-    return 0
+    if docker info >/dev/null 2>&1; then
+      return 0
+    fi
+    local err
+    err="$(docker info 2>&1 || true)"
+    warn "Docker 已安装但当前不可用。"
+    say "- 错误：$(printf "%s\n" "${err}" | sed -n '1p')"
+    if printf "%s\n" "${err}" | grep -qi "permission denied"; then
+      say "可能原因：当前用户无权限访问 docker.sock。"
+      say "可选方案："
+      say "- 使用 sudo 运行本工具"
+      say "- 或将用户加入 docker 组后重新登录：sudo usermod -aG docker $USER"
+    elif printf "%s\n" "${err}" | grep -qi "Cannot connect to the Docker daemon"; then
+      say "可能原因：Docker daemon 未运行。"
+      say "可尝试：sudo systemctl start docker（或 service docker start）"
+    fi
+    return 1
   fi
   say "未检测到 Docker。"
   say "建议安装：Docker Engine + compose 插件。"
@@ -576,6 +606,11 @@ ensure_docker() {
     return 1
   fi
   if confirm "使用官方脚本（get.docker.com）安装 Docker？"; then
+    if ! is_root; then
+      warn "安装 Docker 需要 root 权限。"
+      say "请使用 sudo 重新运行，或手动安装 Docker 后再试。"
+      return 1
+    fi
     require curl
     local tmp mirror
     tmp="$(mktemp)"
@@ -640,6 +675,7 @@ ensure_crontab() {
   if ! confirm "现在安装 cron？"; then
     die "未找到 crontab（请先安装 cron）"
   fi
+  require_root
   local pm; pm="$(pkg_manager)" || die "未找到支持的包管理器（apt/yum/dnf/apk）"
   case "${pm}" in
     apt) pkg_install cron ;;
@@ -1704,7 +1740,7 @@ migrate_export() {
 
   (cd "${svc_dir}" && tar -czf "${out}" .)
   say "打包完成：${out}"
-  say "拷贝示例：scp ${out} root@<target>:/opt/${PROG_NAME}/backups/"
+  say "拷贝示例：scp ${out} <user>@<target>:~/.${PROG_NAME}/backups/（或目标机的 STORD_BACKUPS_DIR）"
 
   if [[ "${was_running}" == "1" ]]; then
     say "恢复服务：${svc}"
@@ -2251,7 +2287,7 @@ self_update() {
     if is_root; then
       :
     else
-      die "没有权限写入 ${target}"
+      die "没有权限写入 ${target}（请用 sudo 运行：sudo -E ${PROG_NAME} self-update；或改用 ${PROG_NAME} install 安装到用户目录）"
     fi
   fi
   local tmp
@@ -2265,15 +2301,17 @@ self_update() {
 
 install_self() {
   require curl
-  require_root
-
-  if [[ -n "${1:-}" ]]; then
-    warn "已忽略安装目录参数，固定安装到 /usr/local/bin"
+  local target_dir="${1:-}"
+  if [[ -z "${target_dir}" ]]; then
+    if is_root; then
+      target_dir="/usr/local/bin"
+    else
+      [[ -n "${HOME:-}" ]] || die "未设置 HOME；请指定安装目录（例如：${PROG_NAME} install /tmp）"
+      target_dir="${HOME}/.local/bin"
+    fi
   fi
 
-  local target_dir="/usr/local/bin"
-
-  mkdir -p "${target_dir}"
+  mkdir -p "${target_dir}" || die "无法创建目录：${target_dir}"
   local target="${target_dir}/${PROG_NAME}"
 
   say "安装/更新 ${PROG_NAME}"
@@ -2283,6 +2321,18 @@ install_self() {
   if ! confirm "继续安装？"; then
     say "已取消。"
     return 0
+  fi
+
+  if [[ ! -w "${target_dir}" ]]; then
+    die "没有权限写入目录：${target_dir}（请用 sudo 运行或选择可写目录安装）"
+  fi
+
+  if [[ -e "${target}" && ! -w "${target}" ]]; then
+    if is_root; then
+      :
+    else
+      die "没有权限写入 ${target}（请用 sudo 运行或选择可写目录安装）"
+    fi
   fi
 
   local tmp
@@ -2300,14 +2350,16 @@ install_self() {
   head -n 1 "${tmp}" | grep -q "bash" || die "下载的脚本看起来不像 bash 脚本"
   chmod +x "${tmp}"
 
-  if [[ -e "${target}" && ! -w "${target}" ]]; then
-    die "没有权限写入 ${target}"
-  fi
   cp -f "${tmp}" "${target}"
   chmod +x "${target}"
   record_add "bin" "${target}" "脚本"
 
   say "安装完成：${target}"
+  if ! is_root; then
+    if ! command -v "${PROG_NAME}" >/dev/null 2>&1; then
+      warn "请将 ${target_dir} 加入 PATH，或使用：${target}"
+    fi
+  fi
 }
 
 is_dir_empty() {
@@ -2332,7 +2384,10 @@ uninstall_script() {
     say "已取消。"
     return 0
   fi
-  rm -f "${bin}"
+  if [[ ! -w "$(dirname "${bin}")" && ! is_root ]]; then
+    die "没有权限删除 ${bin}（请用 sudo 运行：sudo -E ${PROG_NAME} uninstall script）"
+  fi
+  rm -f "${bin}" || die "删除失败：${bin}"
   record_remove_path "${bin}"
   say "已删除：${bin}"
 }
@@ -2467,7 +2522,7 @@ uninstall_all() {
       say "停止容器：${svc}"
       stop_service_dir_best_effort "${path}" || warn "停止容器失败：${svc}"
     fi
-    rm -rf "${path}"
+    rm -rf "${path}" || { warn "删除失败：${path}（可能需要 sudo）"; continue; }
     record_remove_path "${path}"
     say "已删除：${path}"
   done
@@ -2481,9 +2536,9 @@ uninstall_all() {
       continue
     fi
     if [[ -d "${path}" ]]; then
-      rm -rf "${path}"
+      rm -rf "${path}" || { warn "删除失败：${path}（可能需要 sudo）"; continue; }
     else
-      rm -f "${path}"
+      rm -f "${path}" || { warn "删除失败：${path}（可能需要 sudo）"; continue; }
     fi
     record_remove_path "${path}"
     say "已删除：${path}"
@@ -2495,7 +2550,7 @@ uninstall_all() {
     [[ -d "${path}" ]] || continue
     if is_dir_empty "${path}"; then
       if confirm "删除空目录 ${path}？"; then
-        rm -rf "${path}"
+        rm -rf "${path}" || { warn "删除失败：${path}（可能需要 sudo）"; continue; }
         record_remove_path "${path}"
         say "已删除：${path}"
       else
@@ -2568,7 +2623,10 @@ bootstrap_menu() {
     elif [[ -x "${HOME}/.local/bin/${PROG_NAME}" ]]; then
       installed="${HOME}/.local/bin/${PROG_NAME}"
     else
-      die "已安装 ${PROG_NAME} 但不在 PATH 中，请把 /usr/local/bin 加入 PATH 后重试"
+      if is_root; then
+        die "已安装 ${PROG_NAME} 但不在 PATH 中，请把 /usr/local/bin 加入 PATH，或直接运行：/usr/local/bin/${PROG_NAME} menu"
+      fi
+      die "已安装 ${PROG_NAME} 但不在 PATH 中，请把 ~/.local/bin 加入 PATH，或直接运行：~/.local/bin/${PROG_NAME} menu"
     fi
   fi
 
@@ -2894,7 +2952,7 @@ ${PROG_NAME} - 单机存储部署工具
   ${PROG_NAME} menu
   ${PROG_NAME} doctor
   ${PROG_NAME} check-update
-  ${PROG_NAME} install        # 安装到 /usr/local/bin
+  ${PROG_NAME} install [dir]  # root 默认 /usr/local/bin；否则 ~/.local/bin
   ${PROG_NAME} deploy <svc>   # mariadb|mongodb|redis
   ${PROG_NAME} start <svc|all>
   ${PROG_NAME} stop <svc|all>
@@ -3031,7 +3089,6 @@ entry() {
       return 0
       ;;
   esac
-  require_root
   bootstrap_menu "${1:-menu}"
   main "$@"
 }

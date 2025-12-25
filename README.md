@@ -12,42 +12,46 @@
 ## 安装（one-liner）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zxkws/stord/main/stord | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zxkws/stord/main/stord | bash
 ```
 
 这会把 `stord` 安装到：
-- `/usr/local/bin/stord`（需要 root）
+- `~/.local/bin/stord`（默认；无需 root）
+- `/usr/local/bin/stord`（如果用 `sudo bash` 运行）
 
-也可以用 `wget`：
+也可以用 `wget`（手动安装）：
 
 ```bash
 wget -O /tmp/stord https://raw.githubusercontent.com/zxkws/stord/main/stord \
   && chmod +x /tmp/stord \
-  && sudo cp /tmp/stord /usr/local/bin/stord
+  && mkdir -p ~/.local/bin \
+  && cp /tmp/stord ~/.local/bin/stord
 ```
 
-手动安装（离线/内网）：
+root 安装（写入 `/usr/local/bin`）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zxkws/stord/main/stord -o stord
-chmod +x stord
-sudo cp stord /usr/local/bin/stord
+curl -fsSL https://raw.githubusercontent.com/zxkws/stord/main/stord | sudo bash
 ```
 
 ## 运行
 
 ```bash
-sudo -E stord
+stord
 ```
 
 提示：
-- 脚本每次运行都会检查 root；请用 `sudo` 或切换到 root 账户。
-- 默认数据目录是 `/opt/stord`。
+- 脚本默认不会强制要求 root；仅在“安装系统依赖/写入系统目录”等场景会提示需要 sudo。
+- 如果当前用户无权限访问 Docker（`docker info` 报 `permission denied`），可选择：
+  - 用 sudo 运行本工具（例如：`sudo -E stord deploy mariadb`）
+  - 或把当前用户加入 docker 组后重新登录：`sudo usermod -aG docker $USER`
+- 默认数据目录是 `~/.stord`（如果检测到已有 `/opt/stord`，会沿用以保持兼容；也可用 `STORD_HOME` 覆盖）。
 - 所有确认提示默认是 **Yes**，直接回车表示同意默认选项。
 
 ## 依赖
 
 - Linux 服务器（推荐 Ubuntu/Debian/CentOS/Alpine 等）
+- Bash >= 4.0（macOS 自带 bash 3.x 不支持；如需在 Mac 上验证建议用 brew bash 或 Linux 容器）
 - Docker + Docker Compose（脚本会检测；缺失时可选择用官方脚本安装 Docker）
 - 如需“定时备份”：需要 `crontab`（脚本会检测并提示安装），并确保 cron 服务在运行
 
@@ -59,8 +63,8 @@ Docker 安装提示：
 
 ## 快速开始（推荐流程）
 
-1) 安装：`curl ... | sudo bash`
-2) 运行：`sudo -E stord`
+1) 安装：`curl ... | bash`（或 root：`curl ... | sudo bash`）
+2) 运行：`stord`（如需：`sudo -E stord`）
 3) 选择「部署服务」部署 MariaDB/MongoDB/Redis
 4) 进入「管理服务」查看状态/日志/DSN
 5) 配置你的业务应用连接 DSN（建议不要把 DB/Redis 暴露到公网）
@@ -104,15 +108,15 @@ stord dsn mariadb
 
 ## 数据目录结构
 
-默认在 `/opt/stord`：
+默认在 `STORD_HOME`（默认 `~/.stord`；若检测到已有 `/opt/stord` 会沿用）：
 
-- `/opt/stord/services/<svc>/`
+- `STORD_HOME/services/<svc>/`
   - `docker-compose.yml`
   - `.env`（包含端口/账号/密码等敏感信息）
   - `data/`（持久化数据目录）
   - `conf/` 或 `conf.d/`（服务配置）
-- `/opt/stord/backups/`（备份文件）
-- `/opt/stord/logs/`（备份计划任务日志等）
+- `STORD_HOME/backups/`（备份文件）
+- `STORD_HOME/logs/`（备份计划任务日志等）
 
 可用环境变量覆盖根目录：
 
@@ -184,8 +188,8 @@ stord backup prune all 14
 恢复：
 
 ```bash
-stord restore mariadb /opt/stord/backups/mariadb-XXXX.sql.gz
-stord restore mongodb /opt/stord/backups/mongodb-XXXX.archive.gz
+stord restore mariadb ~/.stord/backups/mariadb-XXXX.sql.gz
+stord restore mongodb ~/.stord/backups/mongodb-XXXX.archive.gz
 ```
 
 定时备份（crontab）：
@@ -228,5 +232,5 @@ STORD_NO_UPDATE_CHECK=1 stord
 
 ## 其他
 
-- 默认数据目录：`/opt/stord`
-- 默认时区：`Asia/Seoul`（可自行改各服务的 `.env`）
+- 默认数据目录：`~/.stord`（可用 `STORD_HOME` 覆盖；若已存在 `/opt/stord` 会沿用）
+- 默认时区：`UTC`（可用 `STORD_TZ` / `STORD_DB_TZ` 覆盖）
