@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.9"
+STORD_VERSION="0.2.10"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -39,6 +39,7 @@ STORD_LOG_DIR="${STORD_LOG_DIR:-${STORD_HOME}/logs}"
 STORD_RECORD_FILE="${STORD_RECORD_FILE:-${STORD_STATE_DIR}/install-records}"
 STORD_TZ="${STORD_TZ:-UTC}"
 STORD_DB_TZ="${STORD_DB_TZ:-+00:00}"
+STORD_DEFAULT_BIND="${STORD_DEFAULT_BIND:-127.0.0.1}"
 
 umask 077
 
@@ -740,8 +741,18 @@ compose_up_checked() {
 warn_if_public_bind() {
   local bind="$1" port="$2" svc="$3"
   if [[ "${bind}" == "0.0.0.0" ]]; then
-    warn "${svc} 绑定到 0.0.0.0:${port}（公网可达）。请用防火墙仅放行你的应用服务器 IP。"
+    warn "${svc} 绑定到 0.0.0.0:${port}（公网可达）。请用安全组/防火墙仅放行你的应用服务器 IP。"
   fi
+}
+
+confirm_public_bind() {
+  local bind="$1" port="$2" svc="$3"
+  if [[ "${bind}" != "0.0.0.0" ]]; then
+    return 0
+  fi
+  warn "${svc} 将绑定到 0.0.0.0:${port}（公网可达）。"
+  warn "仅建议在内网或已配置安全组/防火墙白名单时使用。"
+  confirm "仍然使用 0.0.0.0 绑定？"
 }
 
 is_valid_port() {
@@ -928,9 +939,13 @@ deploy_mariadb() {
   old_pass="$(env_get "${svc}" MARIADB_PASSWORD || true)"
   old_rootpw="$(env_get "${svc}" MARIADB_ROOT_PASSWORD || true)"
 
-  default_bind="${old_bind:-0.0.0.0}"
+  default_bind="${old_bind:-${STORD_DEFAULT_BIND}}"
   bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${default_bind}")"
   port="$(select_port "${svc}" "MariaDB" "${old_port:-3306}")"
+  if [[ "${bind}" == "0.0.0.0" ]] && ! confirm_public_bind "${bind}" "${port}" "${svc}"; then
+    warn "已改为绑定 127.0.0.1（更安全）。如需远程访问请重新选择 0.0.0.0 并确认。"
+    bind="127.0.0.1"
+  fi
   db="$(prompt "数据库名" "$(env_default "${svc}" MARIADB_DATABASE "appdb")")"
   user="$(prompt "应用用户名" "$(env_default "${svc}" MARIADB_USER "app")")"
 
@@ -1090,8 +1105,12 @@ deploy_mongodb() {
   old_user="$(env_get "${svc}" MONGO_INITDB_ROOT_USERNAME || true)"
   old_pass="$(env_get "${svc}" MONGO_INITDB_ROOT_PASSWORD || true)"
 
-  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-0.0.0.0}")"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-${STORD_DEFAULT_BIND}}")"
   port="$(select_port "${svc}" "MongoDB" "${old_port:-27017}")"
+  if [[ "${bind}" == "0.0.0.0" ]] && ! confirm_public_bind "${bind}" "${port}" "${svc}"; then
+    warn "已改为绑定 127.0.0.1（更安全）。如需远程访问请重新选择 0.0.0.0 并确认。"
+    bind="127.0.0.1"
+  fi
   rootuser="$(prompt "Mongo root 用户名" "$(env_default "${svc}" MONGO_INITDB_ROOT_USERNAME "root")")"
   rootpass="$(prompt_secret_default "Mongo root 密码" "${old_pass}")"
   if [[ -z "${rootpass}" ]]; then rootpass="$(random_hex 16)"; fi
@@ -1231,8 +1250,12 @@ deploy_redis() {
   old_pass="$(env_get "${svc}" REDIS_PASSWORD || true)"
   old_maxmem="$(env_get "${svc}" REDIS_MAXMEM || true)"
 
-  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-0.0.0.0}")"
+  bind="$(prompt "绑定地址（0.0.0.0 远程可访问，127.0.0.1 仅本机）" "${old_bind:-${STORD_DEFAULT_BIND}}")"
   port="$(select_port "${svc}" "Redis" "${old_port:-6379}")"
+  if [[ "${bind}" == "0.0.0.0" ]] && ! confirm_public_bind "${bind}" "${port}" "${svc}"; then
+    warn "已改为绑定 127.0.0.1（更安全）。如需远程访问请重新选择 0.0.0.0 并确认。"
+    bind="127.0.0.1"
+  fi
   maxmem="$(prompt "Redis maxmemory（如 128mb）" "${old_maxmem:-$(suggest_redis_maxmem_mb)mb}")"
   pass="$(prompt_secret_default "Redis 密码" "${old_pass}")"
   if [[ -z "${pass}" ]]; then pass="$(random_hex 16)"; fi
