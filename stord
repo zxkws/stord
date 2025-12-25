@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.10"
+STORD_VERSION="0.2.11"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -438,6 +438,69 @@ is_redis_maxmem() {
   local v="${1:-}"
   [[ -n "${v}" ]] || return 1
   [[ "${v,,}" =~ ^[0-9]+(kb|mb|gb)$ ]]
+}
+
+compose_file_container_names() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 0
+  awk -F: '
+    /^[[:space:]]*container_name[[:space:]]*:/ {
+      v=$0
+      sub(/^[[:space:]]*container_name[[:space:]]*:[[:space:]]*/, "", v)
+      gsub(/[[:space:]]+$/, "", v)
+      gsub(/^"/, "", v)
+      gsub(/"$/, "", v)
+      if (v != "") print v
+    }
+  ' "${file}"
+}
+
+docker_rm_containers_from_compose_file() {
+  local file="$1"
+  have docker || return 1
+  local any=0 name
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    any=1
+    say "停止并删除容器：${name}"
+    docker rm -f "${name}" >/dev/null 2>&1 || warn "移除容器失败：${name}"
+  done < <(compose_file_container_names "${file}")
+  [[ "${any}" == "1" ]]
+}
+
+stop_service_dir_best_effort() {
+  local svc_dir="${1:?需要服务目录}"
+  local f="${svc_dir}/docker-compose.yml"
+  [[ -f "${f}" ]] || return 0
+
+  if compose_bin >/dev/null 2>&1; then
+    local cb
+    cb="$(compose_bin)" || true
+    case "${cb}" in
+      "docker compose")
+        (cd "${svc_dir}" && docker compose -f docker-compose.yml down) && return 0
+        ;;
+      "docker-compose")
+        (cd "${svc_dir}" && docker-compose -f docker-compose.yml down) && return 0
+        ;;
+    esac
+    warn "停止容器失败（compose down）：${svc_dir}"
+  else
+    warn "compose 不可用，尝试用 docker rm -f 停止容器：${svc_dir}"
+  fi
+
+  if docker_rm_containers_from_compose_file "${f}"; then
+    return 0
+  fi
+
+  # Fallback: best-effort remove by computed container name.
+  local svc
+  svc="$(basename "${svc_dir}")"
+  if have docker; then
+    docker rm -f "$(container_name "${svc}")" >/dev/null 2>&1 || true
+    return 0
+  fi
+  return 1
 }
 
 mask_value() {
@@ -1440,12 +1503,22 @@ logs_all() {
 
 remove_service() {
   local svc="${1:?需要服务名}"
+  local svc_dir; svc_dir="$(service_dir "${svc}")"
   say "移除服务（仅停止容器）：${svc}"
-  if ! confirm "对 ${svc} 执行 docker compose down？"; then
+  if ! confirm "停止 ${svc} 容器？"; then
     say "已取消。"
     return 0
   fi
-  compose "${svc}" down
+  if [[ -f "${svc_dir}/docker-compose.yml" ]]; then
+    stop_service_dir_best_effort "${svc_dir}" || warn "停止容器失败：${svc}"
+  else
+    # Best-effort even if service dir is missing.
+    if have docker; then
+      docker rm -f "$(container_name "${svc}")" >/dev/null 2>&1 || warn "停止容器失败：${svc}"
+    else
+      warn "docker 不可用，无法停止容器：${svc}"
+    fi
+  fi
   say "已停止：${svc}"
 }
 
@@ -1466,7 +1539,12 @@ purge_service() {
     typed="$(prompt "输入 YES 进行确认" "")"
     [[ "${typed}" == "YES" ]] || die "未确认清理"
   fi
-  compose "${svc}" down || true
+  case "${svc}" in
+    mariadb|mongodb) cleanup_backup_crontab_svc "${svc}" || true ;;
+  esac
+  if ! stop_service_dir_best_effort "${svc_dir}"; then
+    warn "无法停止容器（docker/compose 不可用）。可能存在残留容器：${svc}"
+  fi
   rm -rf "${svc_dir}"
   say "已清理：${svc}"
 }
@@ -1986,6 +2064,59 @@ cron_remove_marker() {
   cron_get | grep -v "${marker}" || true
 }
 
+crontab_get_best_effort() {
+  have crontab || return 1
+  crontab -l 2>/dev/null || true
+}
+
+crontab_set_best_effort() {
+  have crontab || return 1
+  local tmp
+  tmp="$(mktemp)"
+  trap 'rm -f "${tmp}"' RETURN
+  cat > "${tmp}"
+  crontab "${tmp}"
+}
+
+cleanup_backup_crontab_all() {
+  have crontab || return 0
+  local prefix="# ${PROG_NAME}:backup:"
+  local lines
+  lines="$(crontab_get_best_effort | grep -F "${prefix}" || true)"
+  [[ -n "${lines}" ]] || return 0
+  say "检测到 crontab 定时备份任务："
+  printf "%s\n" "${lines}" | sed 's/^/  /'
+  if ! confirm "删除以上 crontab 任务？"; then
+    warn "已跳过删除 crontab 任务。卸载后可能残留定时任务。"
+    return 0
+  fi
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
+    die "非交互模式拒绝修改 crontab（使用 --yes）"
+  fi
+  crontab_get_best_effort | grep -Fv "${prefix}" | crontab_set_best_effort || warn "删除 crontab 任务失败"
+  say "已清理 crontab 备份任务。"
+}
+
+cleanup_backup_crontab_svc() {
+  local svc="${1:?需要服务名}"
+  have crontab || return 0
+  local marker="# ${PROG_NAME}:backup:${svc}"
+  local lines
+  lines="$(crontab_get_best_effort | grep -F "${marker}" || true)"
+  [[ -n "${lines}" ]] || return 0
+  say "检测到 ${svc} 的 crontab 定时备份任务："
+  printf "%s\n" "${lines}" | sed 's/^/  /'
+  if ! confirm "删除以上 crontab 任务？"; then
+    warn "已跳过删除 crontab 任务。"
+    return 0
+  fi
+  if [[ "${STORD_NON_INTERACTIVE}" == "1" && "${STORD_ASSUME_YES}" != "1" ]]; then
+    die "非交互模式拒绝修改 crontab（使用 --yes）"
+  fi
+  crontab_get_best_effort | grep -Fv "${marker}" | crontab_set_best_effort || warn "删除 crontab 任务失败"
+  say "已清理 ${svc} 的 crontab 备份任务。"
+}
+
 backup_schedule() {
   local action="${1:-}"
   shift || true
@@ -2320,6 +2451,8 @@ uninstall_all() {
     return 0
   fi
 
+  cleanup_backup_crontab_all || true
+
   # 先处理服务目录
   for item in "${service_items[@]}"; do
     IFS='|' read -r type path desc <<<"${item}"
@@ -2331,12 +2464,8 @@ uninstall_all() {
     local svc
     svc="$(basename "${path}")"
     if [[ -f "${path}/docker-compose.yml" ]]; then
-      if compose_bin >/dev/null 2>&1; then
-        say "停止容器：${svc}"
-        compose "${svc}" down || warn "停止容器失败：${svc}"
-      else
-        warn "compose 不可用，跳过停止容器：${svc}"
-      fi
+      say "停止容器：${svc}"
+      stop_service_dir_best_effort "${path}" || warn "停止容器失败：${svc}"
     fi
     rm -rf "${path}"
     record_remove_path "${path}"

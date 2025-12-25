@@ -154,6 +154,7 @@ stord uninstall mariadb
 说明：
 - 只清理由本脚本创建的服务目录/配置/备份/日志；不会卸载 Docker/cron 等系统组件。
 - 安装/部署路径会记录在 `${STORD_HOME}/state/install-records`，便于卸载时列出并确认。
+- `stord uninstall all` 会尝试清理 `crontab` 中由本工具写入的定时备份任务（`# stord:backup:`）。
 - 如需删除服务数据目录，请使用菜单里的「彻底清理」或命令 `stord purge <svc>`。
 
 ## 安全提示（重要）
