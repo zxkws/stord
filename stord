@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.8"
+STORD_VERSION="0.2.9"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -1788,47 +1788,6 @@ doctor() {
   list_services | sed 's/^/ - /'
 }
 
-firewall_allow() {
-  local port="$1"
-  local ip="$2"
-  if have ufw; then
-    ufw allow from "${ip}" to any port "${port}" proto tcp
-    return 0
-  fi
-  if have firewall-cmd; then
-    firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ip} port port=${port} protocol=tcp accept"
-    firewall-cmd --reload
-    return 0
-  fi
-  die "未找到可用的防火墙工具（ufw 或 firewalld）"
-}
-
-configure_firewall_menu() {
-  say
-  say "防火墙助手（白名单 IP -> 端口）。"
-  say "只会新增放行规则，不会删除已有规则。"
-  say
-  local svc ip port
-  svc="$(prompt "选择服务（mariadb/mongodb/redis/custom）" "")"
-  if [[ "${svc}" == "custom" ]]; then
-    port="$(prompt "放行端口" "")"
-    [[ "${port}" =~ ^[0-9]+$ ]] || die "端口无效：${port}"
-  else
-    port="$(svc_host_port "${svc}")"
-  fi
-  ip="$(prompt "允许的客户端 IPv4（如 1.2.3.4/32）" "")"
-  [[ -n "${ip}" ]] || die "IP 不能为空"
-  if ! confirm "放行 ${ip} -> ${svc} 端口 ${port}？"; then
-    say "已取消。"
-    return 0
-  fi
-  if ! is_root; then
-    die "修改防火墙需要 root 权限"
-  fi
-  firewall_allow "${port}" "${ip}"
-  say "规则已添加。"
-}
-
 backup_list_files() {
   ensure_dirs
   local svc="${1:-all}"
@@ -2743,12 +2702,11 @@ menu() {
     say "1) 管理服务（状态/日志/重启/备份等）"
     say "2) 部署服务"
     say "3) 备份"
-    say "4) 防火墙白名单助手"
-    say "5) Doctor（环境自检）"
-    say "6) 安装/更新 ${PROG_NAME}"
-    say "7) 自更新 ${PROG_NAME}（下载 raw）"
-    say "8) 检查更新"
-    say "9) 卸载/清理"
+    say "4) Doctor（环境自检）"
+    say "5) 安装/更新 ${PROG_NAME}"
+    say "6) 自更新 ${PROG_NAME}（下载 raw）"
+    say "7) 检查更新"
+    say "8) 卸载/清理"
     say "0) 退出"
     say
 
@@ -2763,12 +2721,11 @@ menu() {
         ;;
       2) menu_deploy ;;
       3) menu_backups ;;
-      4) configure_firewall_menu ;;
-      5) doctor ;;
-      6) install_self "" ;;
-      7) self_update ;;
-      8) check_update || true ;;
-      9) menu_uninstall ;;
+      4) doctor ;;
+      5) install_self "" ;;
+      6) self_update ;;
+      7) check_update || true ;;
+      8) menu_uninstall ;;
       0) exit 0 ;;
       *) say "未知选项。" ;;
     esac
@@ -2811,7 +2768,6 @@ ${PROG_NAME} - 单机存储部署工具
   ${PROG_NAME} migrate pull <svc> <user@host|user@host:/path> [local.tgz]
   ${PROG_NAME} config-path <svc>
   ${PROG_NAME} config-edit <svc>
-  ${PROG_NAME} firewall              # 防火墙白名单（root）
   ${PROG_NAME} uninstall [script|all|services|<svc>]
   ${PROG_NAME} self-update [url]
   ${PROG_NAME} --version
@@ -2865,7 +2821,6 @@ main() {
     migrate) shift; migrate "$@" ;;
     config-path) shift; config_path "${1:?需要服务名}" ;;
     config-edit) shift; config_edit "${1:?需要服务名}" ;;
-    firewall) shift; configure_firewall_menu ;;
     self-update) shift; self_update "$@" ;;
     uninstall)
       shift || true
