@@ -45,7 +45,7 @@ stord
 - 如果当前用户无权限访问 Docker（`docker info` 报 `permission denied`），可选择：
   - 用 sudo 运行本工具（例如：`sudo -E stord deploy mariadb`）
   - 或把当前用户加入 docker 组后重新登录：`sudo usermod -aG docker $USER`
-- 默认数据目录是 `~/.stord`（如果检测到已有 `/opt/stord`，会沿用以保持兼容；也可用 `STORD_HOME` 覆盖）。
+- 默认数据目录是 `~/.stord`（可用 `STORD_HOME` 覆盖）。
 - 所有确认提示默认是 **Yes**，直接回车表示同意默认选项。
 
 ## 依赖
@@ -108,7 +108,7 @@ stord dsn mariadb
 
 ## 数据目录结构
 
-默认在 `STORD_HOME`（默认 `~/.stord`；若检测到已有 `/opt/stord` 会沿用）：
+默认在 `STORD_HOME`（默认 `~/.stord`）：
 
 - `STORD_HOME/services/<svc>/`
   - `docker-compose.yml`
@@ -232,5 +232,5 @@ STORD_NO_UPDATE_CHECK=1 stord
 
 ## 其他
 
-- 默认数据目录：`~/.stord`（可用 `STORD_HOME` 覆盖；若已存在 `/opt/stord` 会沿用）
+- 默认数据目录：`~/.stord`（可用 `STORD_HOME` 覆盖）
 - 默认时区：`UTC`（可用 `STORD_TZ` / `STORD_DB_TZ` 覆盖）

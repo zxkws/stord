@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-STORD_VERSION="0.2.12"
+STORD_VERSION="0.2.13"
 
 PROG_NAME_DEFAULT="stord"
 PROG_NAME="${PROG_NAME:-$PROG_NAME_DEFAULT}"
@@ -28,17 +28,12 @@ require_root() {
 }
 
 default_home() {
-  local legacy="/opt/${PROG_NAME}"
-  # Backward compatible: keep using legacy path if it already exists.
-  if [[ -d "${legacy}" ]]; then
-    echo "${legacy}"
-    return 0
-  fi
   if [[ -n "${HOME:-}" ]]; then
     echo "${HOME}/.${PROG_NAME}"
     return 0
   fi
-  echo "${legacy}"
+  # HOME is not set in some non-login environments; fall back to a writable temp dir.
+  echo "/tmp/${PROG_NAME}"
 }
 
 STORD_HOME="${STORD_HOME:-$(default_home)}"
